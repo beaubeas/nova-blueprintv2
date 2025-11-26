@@ -236,7 +236,7 @@ def main(config: dict):
     while time.time() - start < 1800:
         iteration += 1
         start_time = time.time()
-        neighborhood_limit = 30 if (time.time() - start) > 1620 else 0
+        neighborhood_limit = 40 if (time.time() - start) > 1680 else 0
         component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
         elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
         elite_names = elite_df["name"].tolist() if not elite_df.empty else None
@@ -294,7 +294,7 @@ def main(config: dict):
                 score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
             prev_avg_score = current_avg_score
         
-        bt.logging.info(f"[Miner] Iteration {iteration} || Time: {round(time.time() - start_time,2)} | Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | Improve: {score_improvement_rate*100:.2f}% | Elite frac: {elite_frac:.3f} | Mute: {mutation_prob:.3f} | Neighbor: {neighborhood_limit}")
+        bt.logging.info(f"Iteration {iteration} || Time: {round(time.time() - start_time,2)} | Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | Min: {top_pool['score'].min():.4f} | Improve: {score_improvement_rate*100:.2f}% | Elite frac: {elite_frac:.3f} | Mute: {mutation_prob:.3f} | Neighbor: {neighborhood_limit}")
         
         top_entries = {"molecules": top_pool["name"].tolist()}
         with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
