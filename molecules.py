@@ -264,8 +264,8 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
     return result_df.head(n_samples).copy()
 
 
-def generate_molecules_from_pools(rxn_id: int, n: int, pool_A_ids: List[Tuple], pool_B_ids: List[Tuple], 
-                                molecules_C: List[Tuple], is_three_component: bool, seed: int = None,
+def generate_molecules_from_pools(rxn_id: int, n: int, pool_A_ids: list, pool_B_ids: list, 
+                                pool_C_ids: list, is_three_component: bool, seed: int = None,
                                 component_weights: dict = None) -> List[str]:
     
     rng = random.Random(seed) if seed is not None else random
