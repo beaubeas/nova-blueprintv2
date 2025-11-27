@@ -228,28 +228,31 @@ def main(config: dict):
     mutation_prob = 0.1
     elite_frac = 0.25
     prev_avg_score = None
+    current_avg_score = None
     score_improvement_rate = 0.0
     seen_inchikeys = set()
     start = time.time()
 
     n_samples_first_iteration = n_samples if config["allowed_reaction"] == "rxn:5" else n_samples*4
+    neighborhood_limit = 0
+    stagnation_count = 0  # Track consecutive low-improvement iterations
+    
     while time.time() - start < 1800:
         iteration += 1
         start_time = time.time()
-        neighborhood_limit = 2 if (time.time() - start) > 1680 else 0
+        if time.time() - start > 1620:
+            top_pool.to_csv("top_pool.csv", index=False)
+        neighborhood_limit = 2 if (time.time() - start) > 1620 else 0
         component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
         elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
         elite_names = elite_df["name"].tolist() if not elite_df.empty else None
         
-        if prev_avg_score is not None and not top_pool.empty:
-            current_avg = top_pool['score'].mean()
-            score_improvement_rate = (current_avg - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-            if score_improvement_rate > 0.01:  # Good improvement
-                elite_frac = min(0.7, elite_frac * 1.1)
-                mutation_prob = max(0.05, mutation_prob * 0.95)
-            elif score_improvement_rate < -0.01:  # Declining
-                elite_frac = max(0.2, elite_frac * 0.9)
-                mutation_prob = min(0.4, mutation_prob * 1.1)
+        if score_improvement_rate > 0.01:  # Good improvement
+            elite_frac = min(0.7, elite_frac * 1.1)
+            mutation_prob = max(0.05, mutation_prob * 0.95)
+        elif score_improvement_rate < -0.01:  # Declining
+            elite_frac = max(0.2, elite_frac * 0.9)
+            mutation_prob = min(0.4, mutation_prob * 1.1)
             
         data = generate_valid_random_molecules_batch(rxn_id, n_samples=n_samples_first_iteration if iteration == 1 else n_samples, db_path=DB_PATH, subnet_config=config, batch_size=300, elite_names=elite_names, 
                                                      elite_frac=elite_frac, mutation_prob=mutation_prob, avoid_inchikeys=seen_inchikeys, component_weights=component_weights, neighborhood_limit=neighborhood_limit)
@@ -282,19 +285,22 @@ def main(config: dict):
         data['score'] = data['Target'] - (config['antitarget_weight'] * data['Anti'])
         seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
         total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
+        prev_top_pool_keys = set(top_pool['InChIKey'].tolist()) if not top_pool.empty else set()
+        # prev_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+        
         top_pool = pd.concat([top_pool, total_data])
         top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
         top_pool = top_pool.sort_values(by="score", ascending=False)
         top_pool = top_pool.head(config["num_molecules"])
-        
         current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+        current_top_pool_keys = set(top_pool['InChIKey'].tolist()) if not top_pool.empty else set()
+        retained_keys = prev_top_pool_keys & current_top_pool_keys
 
-        if current_avg_score is not None:
-            if prev_avg_score is not None:
-                score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-            prev_avg_score = current_avg_score
-        
-        bt.logging.info(f"Iteration {iteration} || Time: {round(time.time() - start_time,2)} | Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | Min: {top_pool['score'].min():.4f} | Improve: {score_improvement_rate*100:.2f}% | Elite frac: {elite_frac:.3f} | Mute: {mutation_prob:.3f} | Neighbor: {neighborhood_limit}")
+        if current_avg_score is not None and prev_avg_score is not None:
+            score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
+        elif current_avg_score is not None:
+            score_improvement_rate = 0.0
+        bt.logging.info(f"Iteration {iteration} || Time: {round(time.time() - start_time,2)} | Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | Min: {top_pool['score'].min():.4f} | Elite frac: {elite_frac:.2f} | Mute: {mutation_prob:.2f} | Neighbor: {neighborhood_limit} | Retained: {len(retained_keys)}")
         
         top_entries = {"molecules": top_pool["name"].tolist()}
         with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
