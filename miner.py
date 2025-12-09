@@ -9,6 +9,7 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Dict
 import nova_ph2
+from itertools import combinations
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -19,7 +20,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 from nova_ph2.PSICHIC.wrapper import PsichicWrapper
 from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
 
-from molecules import generate_valid_random_molecules_batch
+from molecules import generate_valid_random_molecules_batch, compute_maccs_entropy
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
@@ -220,6 +221,19 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
     
     return candidates.loc[selected[:n_elites]] if selected else candidates.head(n_elites)
 
+
+def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=0.1):
+    smiles_list = pool["smiles"].tolist()
+    for combination in combinations(smiles_list, subset_size):
+        test_subset = top_95_smiles + list(combination)
+        entropy = compute_maccs_entropy(test_subset)
+        if entropy >= entropy_threshold:
+            print(f"Entropy Threshold Met: {entropy:.4f}")
+            return pool[pool["smiles"].isin(combination)]
+
+    print("No combination exceeded the given entropy threshold.")
+    return pd.DataFrame()
+
 def main(config: dict):
     n_samples = config["num_molecules"] * 5
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
@@ -236,28 +250,34 @@ def main(config: dict):
     while time.time() - start < 1800:
         iteration += 1
         start_time = time.time()
-        
+        remaining_time = 1800 - (time.time() - start)
+
+        adjust_for_entropy = False
+        if remaining_time <= 60:
+            adjust_for_entropy = True
+        neighborhood_limit = 2 if (time.time() - start) > 1680 else 0
         component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
-        
         elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
         elite_names = elite_df["name"].tolist() if not elite_df.empty else None
         
         if prev_avg_score is not None and not top_pool.empty:
             current_avg = top_pool['score'].mean()
             score_improvement_rate = (current_avg - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-            
             if score_improvement_rate > 0.01:  # Good improvement
                 elite_frac = min(0.7, elite_frac * 1.1)
                 mutation_prob = max(0.05, mutation_prob * 0.95)
             elif score_improvement_rate < -0.01:  # Declining
                 elite_frac = max(0.2, elite_frac * 0.9)
                 mutation_prob = min(0.4, mutation_prob * 1.1)
-        
+            
         data = generate_valid_random_molecules_batch(rxn_id, n_samples=n_samples_first_iteration if iteration == 1 else n_samples, db_path=DB_PATH, subnet_config=config, batch_size=300, elite_names=elite_names, 
                                                      elite_frac=elite_frac, mutation_prob=mutation_prob, avoid_inchikeys=seen_inchikeys, component_weights=component_weights)
-        
-        bt.logging.info(f"[Miner] Iteration {iteration}: {len(data)} Samples Generated within {round(time.time() - start_time,2)}")
-        
+
+        gen_time = time.time() - start_time
+        bt.logging.info(
+            f"[Miner] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)"
+        )
+
         if data.empty:
             bt.logging.warning(f"[Miner] Iteration {iteration}: No valid molecules produced; continuing")
             continue
@@ -284,25 +304,38 @@ def main(config: dict):
         data['Target'] = target_score_from_data(data['smiles'])
         data['Anti'] = antitarget_scores()
         data['score'] = data['Target'] - (config['antitarget_weight'] * data['Anti'])
-        bt.logging.info(f"[Miner] Iteration {iteration}: Inference finished within {round(time.time() - start_time,2)}")
         seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
-        # Keep Target and Anti columns for statistics
         total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
         top_pool = pd.concat([top_pool, total_data])
         top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
         top_pool = top_pool.sort_values(by="score", ascending=False)
-        top_pool = top_pool.head(config["num_molecules"])
+        if adjust_for_entropy:
+            try:
+                top_95 = top_pool.iloc[:95]
+                remaining_pool = top_pool.iloc[95:]  # Remaining molecules after the top 95
+                additional_5 = select_diverse_subset(remaining_pool, top_95["smiles"].tolist(), subset_size=5, entropy_threshold=config['entropy_min_threshold'])
+                if not additional_5.empty:
+                    top_pool = pd.concat([top_95, additional_5]).reset_index(drop=True)
+                    entropy = compute_maccs_entropy(top_pool['smiles'].to_list())
+                    bt.logging.info(f"[Miner] Iteration {iteration}: New Entropy = {entropy:.4f}")
+                else:
+                    top_pool = top_pool.head(config["num_molecules"])
+                    entropy = compute_maccs_entropy(top_pool['smiles'].to_list())
+                    bt.logging.info(f"[Miner] Iteration {iteration}: New Entropy = {entropy:.4f}")
+            
+            except Exception as e:
+                bt.logging.warning(f"[Miner] Entropy handling failed: {e}")
+        else:
+            top_pool = top_pool.head(config["num_molecules"])
         
-        # Calculate and log statistics
-        avg_score = top_pool['score'].mean()
-        max_score = top_pool['score'].max()
-        min_score = top_pool['score'].min()
-        avg_target = top_pool['Target'].mean() if 'Target' in top_pool.columns else 0
-        avg_antitarget = top_pool['Anti'].mean() if 'Anti' in top_pool.columns else 0
+        current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+
+        if current_avg_score is not None:
+            if prev_avg_score is not None:
+                score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
+            prev_avg_score = current_avg_score
         
-        bt.logging.info(f"[Miner] Iteration {iteration}: Average top score: {avg_score:.4f}")
-        bt.logging.info(f"[Miner] Iteration {iteration}: Max score: {max_score:.4f}, Min score: {min_score:.4f}")
-        bt.logging.info(f"[Miner] Iteration {iteration}: Finished within {round(time.time() - start_time,2)}")
+        bt.logging.info(f"Iteration {iteration} || Time: {round(time.time() - start_time,2)} | Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | Min: {top_pool['score'].min():.4f} | Improve: {score_improvement_rate*100:.2f}% | Elite frac: {elite_frac:.3f} | Mute: {mutation_prob:.3f} | Neighbor: {neighborhood_limit}")
         
         top_entries = {"molecules": top_pool["name"].tolist()}
         with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
