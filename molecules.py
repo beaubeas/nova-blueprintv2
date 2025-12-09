@@ -14,9 +14,11 @@ warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
 from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from nova_ph2.utils.molecules import get_heavy_atom_count
 from collections import defaultdict
+from itertools import chain
+import numpy as np
+import math
 
-
-@lru_cache(maxsize=200_000)
+@lru_cache(maxsize=1000_000)
 def _get_smiles_from_reaction_cached(name: str):
     """Cache SMILES retrieval to avoid repeated database queries."""
     try:
@@ -24,7 +26,7 @@ def _get_smiles_from_reaction_cached(name: str):
     except Exception:
         return None
 
-@lru_cache(maxsize=200_000)
+@lru_cache(maxsize=1000_000)
 def _mol_from_smiles_cached(smiles: str):
     """Cache molecule parsing to avoid repeated SMILES parsing."""
     if not smiles:
@@ -35,7 +37,7 @@ def _mol_from_smiles_cached(smiles: str):
         return None
 
 
-@lru_cache(maxsize=200_000)
+@lru_cache(maxsize=1000_000)
 def _maccs_fp_from_smiles_cached(smiles: str):
     """Cache MACCS fingerprints for SMILES strings for fast Tanimoto similarity."""
     if not smiles:
@@ -48,7 +50,7 @@ def _maccs_fp_from_smiles_cached(smiles: str):
     except Exception:
         return None
 
-@lru_cache(maxsize=200_000)
+@lru_cache(maxsize=1000_000)
 def _inchikey_from_name_cached(name: str) -> str:
     """Cache InChIKey generation from molecule name to avoid repeated computation."""
     try:
@@ -58,6 +60,30 @@ def _inchikey_from_name_cached(name: str) -> str:
         return generate_inchikey(s)
     except Exception:
         return ""
+
+def compute_maccs_entropy(smiles_list: list[str]) -> float:
+    n_bits = 167  # RDKit uses 167 bits (index 0 is always 0)
+    bit_counts = np.zeros(n_bits)
+    valid_mols = 0
+
+    for smi in smiles_list:
+        fp = _maccs_fp_from_smiles_cached(smi)
+        arr = np.array(fp)
+        bit_counts += arr
+        valid_mols += 1
+
+    if valid_mols == 0:
+        raise ValueError("No valid molecules found.")
+
+    probs = bit_counts / valid_mols
+    entropy_per_bit = np.array([
+        -p * math.log2(p) - (1 - p) * math.log2(1 - p) if 0 < p < 1 else 0
+        for p in probs
+    ])
+
+    avg_entropy = np.mean(entropy_per_bit)
+
+    return avg_entropy
 
 def num_rotatable_bonds(smiles: str) -> int:
     """Get number of rotatable bonds from SMILES string."""
@@ -127,54 +153,101 @@ def compute_tanimoto_similarity_to_pool(
 
     return pd.Series(similarities, dtype=float)
 
+seen_cache = {}
 
 def sample_random_valid_molecules(
-    rxn_id: int,
     n_samples: int,
-    db_path: str,
     subnet_config: dict,
     avoid_inchikeys: set[str] | None = None,
+    focus_neighborhood_of: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    global seen_cache
     """
     Sample random valid molecules for a reaction, without using elites or
     component weights. This is intended to provide a "pure" random pool
     for similarity-based selection.
+    
+    If focus_neighborhood_of is provided, we'll focus sampling around the
+    neighborhood of those molecules by generating names in the vicinity.
+    Excludes previously seen molecules based on avoid_inchikeys.
+
+    Also tracks how many times a molecule has been seen and adjusts the neighborhood
+    sampling range based on the count of times it has been seen.
     """
-    reaction_info = get_reaction_info(rxn_id, db_path)
-    if not reaction_info:
-        bt.logging.error(f"[sample_random_valid_molecules] Could not get reaction info for rxn_id {rxn_id}")
-        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
-    smarts, roleA, roleB, roleC = reaction_info
-    is_three_component = roleC is not None and roleC != 0
+    # Extract neighborhoods from each name in the focus DataFrame
+    names = []
+    bt.logging.info(f"Cache : {seen_cache}")
+    for name in focus_neighborhood_of["name"]:
+        try:
+            parts = name.split(":")
+            if len(parts) == 4:
+                rxn_prefix, rxn_type, comp1_id, comp2_id = parts
+                comp1_id = int(comp1_id)
+                comp2_id = int(comp2_id)
+                
+                # Check if this molecule has been seen before, and adjust range accordingly
+                seen_count = seen_cache.get(name, 0) + 1
+                seen_cache[name] = seen_count
 
-    molecules_A = get_molecules_by_role(roleA, db_path)
-    molecules_B = get_molecules_by_role(roleB, db_path)
-    molecules_C = get_molecules_by_role(roleC, db_path) if is_three_component else []
+                comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
+                bt.logging.info(f"Range: ({comp1_id - seen_count * n_samples},{comp1_id - (seen_count-1) * n_samples})  and ({comp1_id + (seen_count - 1) * n_samples},{comp1_id + seen_count * n_samples + 1})")
+                for new_comp1 in comp1_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+                # Generate neighborhood around comp2_id (keep comp1_id fixed)
+                comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
+                for new_comp2 in comp2_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+            if len(parts) == 5:
+                rxn_prefix, rxn_type, comp1_id, comp2_id, comp3_id = parts
+                comp1_id = int(comp1_id)
+                comp2_id = int(comp2_id)
+                comp3_id = int(comp3_id)
+                
+                # Check if this molecule has been seen before, and adjust range accordingly
+                seen_count = seen_cache.get(name, 0) + 1
+                seen_cache[name] = seen_count
+                # Generate neighborhood around comp1_id (keep comp2_id and comp3_id fixed)
+                comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
+                for new_comp1 in comp1_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}:{comp3_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+                # Generate neighborhood around comp2_id (keep comp1_id and comp3_id fixed)
+                comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
+                for new_comp2 in comp2_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}:{comp3_id}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
+                
+                # Generate neighborhood around comp3_id (keep comp1_id and comp2_id fixed)
+                comp3_range = chain(range(max(1, comp3_id - seen_count * n_samples), comp3_id - (seen_count-1) * n_samples), range(max(1, comp3_id + (seen_count - 1) * n_samples), comp3_id + seen_count * n_samples + 1))
+                for new_comp3 in comp3_range:
+                    new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{comp2_id}:{new_comp3}"
+                    if avoid_inchikeys and new_name in avoid_inchikeys:
+                        continue  # Skip if this molecule has already been seen
+                    names.append(new_name)
 
-    if not molecules_A or not molecules_B or (is_three_component and not molecules_C):
-        bt.logging.error(
-            f"[sample_random_valid_molecules] No molecules found for roles A={roleA}, B={roleB}, C={roleC}"
-        )
-        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
-
-    # We may need to oversample names a bit to account for validation/duplicates.
-    batch_size = max(n_samples * 2, 300)
-    names = generate_molecules_from_pools(
-        rxn_id,
-        batch_size,
-        molecules_A,
-        molecules_B,
-        molecules_C,
-        is_three_component,
-        seed=None,
-        component_weights=None,
-    )
-
+        except (ValueError, IndexError) as e:
+            bt.logging.warning(f"Could not parse name '{name}': {e}")
+            continue
+    
     if not names:
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
     df = pd.DataFrame({"name": names})
+    
     df = df[df["name"].notna()]
     if df.empty:
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
@@ -185,11 +258,11 @@ def sample_random_valid_molecules(
 
     df = df.drop_duplicates(subset=["InChIKey"], keep="first")
 
-    # Filter out any molecules we've already seen to avoid wasting CPU effort
     if avoid_inchikeys:
         df = df[~df["InChIKey"].isin(avoid_inchikeys)]
 
     return df[["name", "smiles", "InChIKey"]].head(n_samples).copy()
+
 
 
 def validate_molecules(data: pd.DataFrame, config: dict) -> pd.DataFrame:
@@ -201,20 +274,16 @@ def validate_molecules(data: pd.DataFrame, config: dict) -> pd.DataFrame:
     if data.empty:
         return data
     
-    # Use vectorized operations where possible - apply is cached so it's reasonably fast
     data = data.copy()
     data['smiles'] = data["name"].apply(_get_smiles_from_reaction_cached)
     
-    # Filter out None SMILES early
     data = data[data['smiles'].notna()]
     if data.empty:
         return data
     
-    # Get descriptors for all molecules at once - apply is necessary here since functions aren't vectorizable
     data['heavy_atoms'] = data["smiles"].apply(get_heavy_atom_count)
     data['bonds'] = data["smiles"].apply(num_rotatable_bonds)
     
-    # Filter by constraints BEFORE generating InChIKeys (saves expensive computation)
     mask = (
         (data['heavy_atoms'] >= config['min_heavy_atoms']) &
         (data['bonds'] >= config['min_rotatable_bonds']) &
@@ -222,7 +291,6 @@ def validate_molecules(data: pd.DataFrame, config: dict) -> pd.DataFrame:
     )
     data = data[mask]
     
-    # Only generate InChIKeys for molecules that passed validation
     if not data.empty:
         data['InChIKey'] = data["smiles"].apply(generate_inchikey)
     
@@ -276,6 +344,21 @@ def generate_valid_random_molecules_batch(
         bt.logging.error(f"No molecules found for roles A={roleA}, B={roleB}, C={roleC}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
+    elite_As, elite_Bs, elite_Cs = set(), set(), set()
+    if elite_names:
+        for name in elite_names:
+            A, B, C = _parse_components(name)
+            if A is not None: 
+                elite_As.add(A)
+            if B is not None: 
+                elite_Bs.add(B)
+            if C is not None and is_three_component: 
+                elite_Cs.add(C)
+
+    pool_A_ids = _ids_from_pool(molecules_A)
+    pool_B_ids = _ids_from_pool(molecules_B)
+    pool_C_ids = _ids_from_pool(molecules_C) if is_three_component else []
+
     valid_dfs = []
     seen_keys = set()
     total_valid = 0
@@ -292,16 +375,18 @@ def generate_valid_random_molecules_batch(
             elite_batch = generate_offspring_from_elites(
                 rxn_id=rxn_id,
                 n=n_elite,
-                elite_names=elite_names,
-                molecules_A=molecules_A,
-                molecules_B=molecules_B,
-                molecules_C=molecules_C,
+                pool_A_ids=pool_A_ids,
+                pool_B_ids=pool_B_ids,
+                pool_C_ids=pool_C_ids,
                 is_three_component=is_three_component,
                 mutation_prob=mutation_prob,
                 seed=seed,
                 avoid_names=emitted_names,
                 avoid_inchikeys=avoid_inchikeys,
                 max_tries=10,
+                elite_As=elite_As,
+                elite_Bs=elite_Bs,
+                elite_Cs=elite_Cs,
             )
             emitted_names.update(elite_batch)
 
@@ -416,26 +501,18 @@ def _ids_from_pool(pool):
 
 def generate_offspring_from_elites(rxn_id: int, n: int,
                                    is_three_component: bool,
-                                   elite_names:list,
-                                   molecules_A:list,
-                                   molecules_B:list,
-                                   molecules_C:list,
+                                   pool_A_ids:list,
+                                   pool_B_ids:list,
+                                   pool_C_ids:list,
                                    mutation_prob: float = 0.1, seed: int | None = None,
                                    avoid_names: set[str] = None,
                                    avoid_inchikeys: set[str] = None,
-                                   max_tries: int = 10) -> list[str]:
+                                   max_tries: int = 10,
+                                   elite_As: set[int] = None,
+                                   elite_Bs: set[int] = None,
+                                   elite_Cs: set[int] = None) -> list[str]:
     
     rng = random.Random(seed) if seed is not None else random
-    elite_As, elite_Bs, elite_Cs = set(), set(), set()
-    for name in elite_names:
-        A, B, C = _parse_components(name)
-        if A is not None: elite_As.add(A)
-        if B is not None: elite_Bs.add(B)
-        if C is not None and is_three_component: elite_Cs.add(C)
-
-    pool_A_ids = _ids_from_pool(molecules_A)
-    pool_B_ids = _ids_from_pool(molecules_B)
-    pool_C_ids = _ids_from_pool(molecules_C) if is_three_component else []
     
     elite_As_list = list(elite_As) if elite_As else []
     elite_Bs_list = list(elite_Bs) if elite_Bs else []
@@ -443,7 +520,6 @@ def generate_offspring_from_elites(rxn_id: int, n: int,
 
     out = []
     local_names = set()
-    # Pre-check if we need to avoid InChIKeys to optimize the inner loop
     check_inchikeys = avoid_inchikeys is not None and len(avoid_inchikeys) > 0
     
     for _ in range(n):
@@ -494,7 +570,6 @@ def generate_offspring_from_elites(rxn_id: int, n: int,
         if avoid_names is not None:
             avoid_names.add(cand)
     return out
-
 
 def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.7) -> pd.DataFrame:
     """
