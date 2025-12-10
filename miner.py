@@ -249,9 +249,9 @@ def main(config: dict):
                 cpu_future = cpu_executor.submit(
                     _cpu_random_candidates_with_similarity,
                     iteration,
-                    100,
+                    30,
                     config,
-                    top_pool.head(5)[["name", "smiles", "InChIKey"]],
+                    top_pool.head(10)[["name", "smiles", "InChIKey"]],
                     seen_inchikeys,
                     0.9
                 )
