@@ -487,7 +487,7 @@ def main(config: dict):
             avg_score = float(top_pool['score'].mean()) if not top_pool.empty else 0.0
             max_score = float(top_pool['score'].max()) if not top_pool.empty else 0.0
             min_score = float(top_pool['score'].min()) if not top_pool.empty else 0.0
-            
+            print(f"AVG: {avg_score} | MAX: {max_score} | IMP: {score_improvement_rate} ")
             top_entries = {"molecules": top_pool["name"].tolist()}
             
             # Enhanced logging with time progress
