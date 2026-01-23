@@ -18,7 +18,6 @@ from collections import defaultdict
 from itertools import chain
 import numpy as np
 import math
-from sklearn.cluster import AgglomerativeClustering
 
 # Try to import synthon search
 try:
@@ -32,209 +31,114 @@ except ImportError:
 MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 
-# ==================== V8 ULTRA-AGGRESSIVE FEATURES ====================
+# ==================== V3 ADDITION: ADVANCED SIMILARITY SEARCH ====================
 
-class ComponentSynergyMatrix:
-    """V8: Ultra-aggressive synergy tracking with maximum score prediction."""
+def select_similar_molecules(iteration: int, index: int, target_molecule: pd.Series, n: int, 
+                            similarity_threshold: float, db_path: str, rxn_id: int, config: dict) -> pd.DataFrame:
+    """
+    Advanced similarity search using molecular graph embeddings and cosine similarity.
+    This is the KEY ADDITION from v2: finds high-quality similar molecules using deep features.
     
-    def __init__(self):
-        self.synergy_scores = defaultdict(lambda: defaultdict(list))
-        self.pair_counts = defaultdict(lambda: defaultdict(int))
-        self.max_synergy = defaultdict(lambda: defaultdict(float))
-        self.recent_synergy = defaultdict(lambda: defaultdict(list))  # V8: Track recent scores
-    
-    def update(self, molecule_name: str, score: float):
-        """Update synergy matrix with a scored molecule."""
-        parts = molecule_name.split(":")
-        if len(parts) < 4:
-            return
+    Args:
+        iteration: Current iteration number
+        index: Index of target molecule in top pool
+        target_molecule: Target molecule to find similar ones to
+        n: Number of candidates to sample
+        similarity_threshold: Minimum cosine similarity (0.95 is very tight)
+        db_path: Path to molecule database
+        rxn_id: Reaction ID
+        config: Configuration dictionary
         
-        try:
-            if len(parts) == 4:
-                _, rxn, A_id, B_id = parts
-                A_id, B_id = int(A_id), int(B_id)
-                
-                self.synergy_scores['AB'][(A_id, B_id)].append(score)
-                self.pair_counts['AB'][(A_id, B_id)] += 1
-                self.max_synergy['AB'][(A_id, B_id)] = max(self.max_synergy['AB'][(A_id, B_id)], score)
-                # V8: Track recent scores (last 5)
-                self.recent_synergy['AB'][(A_id, B_id)].append(score)
-                if len(self.recent_synergy['AB'][(A_id, B_id)]) > 5:
-                    self.recent_synergy['AB'][(A_id, B_id)].pop(0)
-                
-            else:
-                _, rxn, A_id, B_id, C_id = parts
-                A_id, B_id, C_id = int(A_id), int(B_id), int(C_id)
-                
-                self.synergy_scores['AB'][(A_id, B_id)].append(score)
-                self.synergy_scores['AC'][(A_id, C_id)].append(score)
-                self.synergy_scores['BC'][(B_id, C_id)].append(score)
-                
-                self.pair_counts['AB'][(A_id, B_id)] += 1
-                self.pair_counts['AC'][(A_id, C_id)] += 1
-                self.pair_counts['BC'][(B_id, C_id)] += 1
-                
-                self.max_synergy['AB'][(A_id, B_id)] = max(self.max_synergy['AB'][(A_id, B_id)], score)
-                self.max_synergy['AC'][(A_id, C_id)] = max(self.max_synergy['AC'][(A_id, C_id)], score)
-                self.max_synergy['BC'][(B_id, C_id)] = max(self.max_synergy['BC'][(B_id, C_id)], score)
-                
-                # V8: Track recent scores
-                for pair_type, pair in [('AB', (A_id, B_id)), ('AC', (A_id, C_id)), ('BC', (B_id, C_id))]:
-                    self.recent_synergy[pair_type][pair].append(score)
-                    if len(self.recent_synergy[pair_type][pair]) > 5:
-                        self.recent_synergy[pair_type][pair].pop(0)
-                
-        except (ValueError, IndexError):
-            pass
+    Returns:
+        DataFrame with similar molecules (name, smiles, InChIKey)
+    """
+    from nova_ph2.PSICHIC.psichic_utils import ligand_init
+    from sklearn.metrics.pairwise import cosine_similarity
     
-    def get_expected_synergy(self, A_id: int, B_id: int, C_id: int = None) -> float:
-        """V8: Ultra-aggressive - favor max synergy even more (75% max, 25% avg)."""
-        if C_id is None:
-            if (A_id, B_id) in self.synergy_scores['AB']:
-                scores = self.synergy_scores['AB'][(A_id, B_id)]
-                avg_score = np.mean(scores)
-                max_score = self.max_synergy['AB'][(A_id, B_id)]
-                # V8: Even more aggressive - 75% max, 25% avg
-                recent_avg = np.mean(self.recent_synergy['AB'][(A_id, B_id)]) if self.recent_synergy['AB'][(A_id, B_id)] else avg_score
-                # V8: Weight recent performance slightly
-                return 0.75 * max_score + 0.20 * avg_score + 0.05 * recent_avg
-            return 0.0
+    smarts, roleA, roleB, roleC = get_reaction_info(rxn_id, db_path)
+    is_three_component = True if roleC is not None and roleC != 0 else False
+    molecules_A = get_molecules_by_role(roleA, db_path)
+    molecules_B = get_molecules_by_role(roleB, db_path)
+    molecules_C = get_molecules_by_role(roleC, db_path) if is_three_component else []
+
+    candidate_names = []
+    target_comp_A, target_comp_B, target_comp_C = _parse_components(target_molecule['name'])
+
+    # Generate candidates by varying one component at a time
+    if is_three_component:
+        for mol_id_C, _, _ in molecules_C:
+            candidate_names.append(f"rxn:{rxn_id}:{target_comp_A}:{target_comp_B}:{mol_id_C}")
+        for mol_id_B, _, _ in molecules_B:
+            candidate_names.append(f"rxn:{rxn_id}:{target_comp_A}:{mol_id_B}:{target_comp_C}")
+        for mol_id_A, _, _ in molecules_A:
+            candidate_names.append(f"rxn:{rxn_id}:{mol_id_A}:{target_comp_B}:{target_comp_C}")
+    else:
+        for mol_id_B, _, _ in molecules_B:
+            candidate_names.append(f"rxn:{rxn_id}:{target_comp_A}:{mol_id_B}")
+        for mol_id_A, _, _ in molecules_A:
+            candidate_names.append(f"rxn:{rxn_id}:{mol_id_A}:{target_comp_B}")
+    
+    candidate_names = list(set(candidate_names))
+    
+    # Sample candidates
+    data = pd.DataFrame({'name': candidate_names})
+    data = data.sample(min(n, len(data))).reset_index(drop=True)
+    data['smiles'] = data['name'].apply(_get_smiles_from_reaction_cached)
+    data = data[data['smiles'].notna()].reset_index(drop=True)
+    
+    # Generate molecular graph embeddings
+    all_smiles = data['smiles'].tolist() + [target_molecule['smiles']]
+    ligand_dict = ligand_init(all_smiles)
+    
+    target_vector = _convert_vector(ligand_dict, target_molecule['smiles'])
+    
+    if target_vector is None:
+        bt.logging.warning("Could not generate vector for target molecule")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+    
+    # Convert all candidates to vectors
+    data['vector'] = data['smiles'].apply(lambda x: _convert_vector(ligand_dict, x))
+    data = data[data['vector'].notna()].reset_index(drop=True)
+    
+    # Compute cosine similarity
+    data['similarity'] = data['vector'].apply(
+        lambda x: cosine_similarity(target_vector, x)[0][0] if x is not None else 0.0
+    )
+    data = data[data['similarity'] >= similarity_threshold]
+    data['InChIKey'] = data['smiles'].apply(generate_inchikey)
+    
+    # Validate molecules
+    data = validate_molecules(data, config)
+    data = data.sort_values('similarity', ascending=False)
+    return data[['name', 'smiles', 'InChIKey']]
+
+
+def _convert_vector(ligand_dict: dict, smiles: str) -> np.ndarray:
+    """Convert molecular graph to feature vector using mean pooling."""
+    import torch
+    
+    if smiles not in ligand_dict:
+        return None
+    
+    graph = ligand_dict[smiles]
+    if graph and 'atom_feature' in graph:
+        atom_features = graph['atom_feature']
+        
+        if torch.is_tensor(atom_features):
+            atom_features = atom_features.numpy()
         else:
-            synergies = []
-            max_synergies = []
-            recent_synergies = []
-            if (A_id, B_id) in self.synergy_scores['AB']:
-                scores = self.synergy_scores['AB'][(A_id, B_id)]
-                synergies.append(np.mean(scores))
-                max_synergies.append(self.max_synergy['AB'][(A_id, B_id)])
-                recent_synergies.append(np.mean(self.recent_synergy['AB'][(A_id, B_id)]) if self.recent_synergy['AB'][(A_id, B_id)] else np.mean(scores))
-            if (A_id, C_id) in self.synergy_scores['AC']:
-                scores = self.synergy_scores['AC'][(A_id, C_id)]
-                synergies.append(np.mean(scores))
-                max_synergies.append(self.max_synergy['AC'][(A_id, C_id)])
-                recent_synergies.append(np.mean(self.recent_synergy['AC'][(A_id, C_id)]) if self.recent_synergy['AC'][(A_id, C_id)] else np.mean(scores))
-            if (B_id, C_id) in self.synergy_scores['BC']:
-                scores = self.synergy_scores['BC'][(B_id, C_id)]
-                synergies.append(np.mean(scores))
-                max_synergies.append(self.max_synergy['BC'][(B_id, C_id)])
-                recent_synergies.append(np.mean(self.recent_synergy['BC'][(B_id, C_id)]) if self.recent_synergy['BC'][(B_id, C_id)] else np.mean(scores))
-            
-            if synergies:
-                avg_synergy = np.mean(synergies)
-                max_synergy = np.mean(max_synergies) if max_synergies else avg_synergy
-                recent_synergy = np.mean(recent_synergies) if recent_synergies else avg_synergy
-                return 0.75 * max_synergy + 0.20 * avg_synergy + 0.05 * recent_synergy
-            return 0.0
+            atom_features = np.array(atom_features)
+        
+        # Mean pooling over atoms to get molecule-level vector
+        mol_vector = np.mean(atom_features, axis=0)
+        
+        # Reshape to (1, n_features) for cosine_similarity
+        return mol_vector.reshape(1, -1)
     
-    def get_best_pairs(self, pair_type: str = 'AB', top_k: int = 20) -> List[Tuple]:
-        """Get the best scoring component pairs."""
-        if pair_type not in self.synergy_scores:
-            return []
-        
-        pair_avgs = []
-        for pair, scores in self.synergy_scores[pair_type].items():
-            if len(scores) >= 1:
-                max_score = self.max_synergy[pair_type][pair]
-                pair_avgs.append((pair, max_score))
-        
-        pair_avgs.sort(key=lambda x: x[1], reverse=True)
-        return pair_avgs[:top_k]
+    return None
 
 
-def cluster_molecules(molecules_df: pd.DataFrame, n_clusters: int = 5) -> Dict[int, pd.DataFrame]:
-    """Cluster molecules by MACCS fingerprint similarity for hierarchical exploitation."""
-    if len(molecules_df) < n_clusters:
-        return {0: molecules_df}
-    
-    try:
-        fps = []
-        valid_indices = []
-        for idx, row in molecules_df.iterrows():
-            fp = _maccs_fp_from_smiles_cached(row['smiles'])
-            if fp is not None:
-                fps.append(list(fp))
-                valid_indices.append(idx)
-        
-        if len(fps) < n_clusters:
-            return {0: molecules_df}
-        
-        fps_array = np.array(fps)
-        clustering = AgglomerativeClustering(n_clusters=n_clusters, metric='euclidean', linkage='average')
-        labels = clustering.fit_predict(fps_array)
-        
-        clusters = {}
-        for i, idx in enumerate(valid_indices):
-            cluster_id = labels[i]
-            if cluster_id not in clusters:
-                clusters[cluster_id] = []
-            clusters[cluster_id].append(idx)
-        
-        result = {}
-        for cluster_id, indices in clusters.items():
-            result[cluster_id] = molecules_df.loc[indices].copy()
-        
-        return result
-        
-    except Exception as e:
-        bt.logging.warning(f"Clustering failed: {e}, returning single cluster")
-        return {0: molecules_df}
-
-
-def compute_quality_score(molecule_name: str, component_weights: dict, synergy_matrix: ComponentSynergyMatrix) -> float:
-    """V8: Ultra-aggressive quality estimation with exponential component interaction."""
-    parts = molecule_name.split(":")
-    if len(parts) < 4:
-        return 0.0
-    
-    try:
-        if len(parts) == 4:
-            _, rxn, A_id, B_id = parts
-            A_id, B_id = int(A_id), int(B_id)
-            
-            comp_A = component_weights.get('A', {}).get(A_id, 0.0)
-            comp_B = component_weights.get('B', {}).get(B_id, 0.0)
-            comp_score = (comp_A + comp_B) / 2
-            
-            synergy_score = synergy_matrix.get_expected_synergy(A_id, B_id)
-            
-            # V8: Exponential component boost for high-quality pairs
-            if comp_A > 0.5 and comp_B > 0.5:
-                component_boost = 1.0 + 0.5 * (comp_A + comp_B)  # V8: Increased from 0.3
-            elif comp_A > 0.4 or comp_B > 0.4:
-                component_boost = 1.0 + 0.2 * max(comp_A, comp_B)
-            else:
-                component_boost = 1.0
-            
-            # V8: Even more aggressive - 15% component, 85% synergy
-            return (0.15 * comp_score + 0.85 * synergy_score) * component_boost
-            
-        else:
-            _, rxn, A_id, B_id, C_id = parts
-            A_id, B_id, C_id = int(A_id), int(B_id), int(C_id)
-            
-            comp_A = component_weights.get('A', {}).get(A_id, 0.0)
-            comp_B = component_weights.get('B', {}).get(B_id, 0.0)
-            comp_C = component_weights.get('C', {}).get(C_id, 0.0)
-            comp_score = (comp_A + comp_B + comp_C) / 3
-            
-            synergy_score = synergy_matrix.get_expected_synergy(A_id, B_id, C_id)
-            
-            # V8: Exponential boost for multiple high-quality components
-            high_quality_count = sum([comp_A > 0.5, comp_B > 0.5, comp_C > 0.5])
-            if high_quality_count >= 3:
-                component_boost = 1.0 + 0.4 * (comp_A + comp_B + comp_C) / 3
-            elif high_quality_count >= 2:
-                component_boost = 1.0 + 0.3 * high_quality_count
-            else:
-                component_boost = 1.0
-            
-            return (0.15 * comp_score + 0.85 * synergy_score) * component_boost
-            
-    except (ValueError, IndexError):
-        return 0.0
-
-
-# ==================== END V8 FEATURES ====================
+# ==================== END V3 ADDITION ====================
 
 
 @lru_cache(maxsize=1000_000)
@@ -281,7 +185,7 @@ def _inchikey_from_name_cached(name: str) -> str:
         return ""
 
 def compute_maccs_entropy(smiles_list: list[str]) -> float:
-    n_bits = 167
+    n_bits = 167  # RDKit uses 167 bits (index 0 is always 0)
     bit_counts = np.zeros(n_bits)
     valid_mols = 0
 
@@ -343,8 +247,10 @@ def compute_tanimoto_similarity_to_pool(
     Returns a Series indexed like candidate_smiles.
     """
     if candidate_smiles.empty or pool_smiles.empty:
+        # Return zeros with matching index
         return pd.Series(0.0, index=candidate_smiles.index, dtype=float)
 
+    # Pre-compute fingerprints for pool molecules
     pool_fps = []
     for smi in pool_smiles.dropna().unique():
         fp = _maccs_fp_from_smiles_cached(smi)
@@ -391,6 +297,7 @@ def sample_random_valid_molecules(
                 comp1_id = int(comp1_id)
                 comp2_id = int(comp2_id)
                 
+                # Check if this molecule has been seen before, and adjust range accordingly
                 seen_count = seen_cache.get(name, 0) + 1
                 seen_cache[name] = seen_count
 
@@ -398,14 +305,15 @@ def sample_random_valid_molecules(
                 for new_comp1 in comp1_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}"
                     if avoid_inchikeys and new_name in avoid_inchikeys:
-                        continue
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
+                # Generate neighborhood around comp2_id (keep comp1_id fixed)
                 comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
                 for new_comp2 in comp2_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}"
                     if avoid_inchikeys and new_name in avoid_inchikeys:
-                        continue
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
             if len(parts) == 5:
@@ -414,27 +322,31 @@ def sample_random_valid_molecules(
                 comp2_id = int(comp2_id)
                 comp3_id = int(comp3_id)
                 
+                # Check if this molecule has been seen before, and adjust range accordingly
                 seen_count = seen_cache.get(name, 0) + 1
                 seen_cache[name] = seen_count
+                # Generate neighborhood around comp1_id (keep comp2_id and comp3_id fixed)
                 comp1_range = chain(range(max(1, comp1_id - seen_count * n_samples), comp1_id - (seen_count-1) * n_samples), range(max(1, comp1_id + (seen_count - 1) * n_samples), comp1_id + seen_count * n_samples + 1))
                 for new_comp1 in comp1_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{new_comp1}:{comp2_id}:{comp3_id}"
                     if avoid_inchikeys and new_name in avoid_inchikeys:
-                        continue
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
+                # Generate neighborhood around comp2_id (keep comp1_id and comp3_id fixed)
                 comp2_range = chain(range(max(1, comp2_id - seen_count * n_samples), comp2_id - (seen_count-1) * n_samples), range(max(1, comp2_id + (seen_count - 1) * n_samples), comp2_id + seen_count * n_samples + 1))
                 for new_comp2 in comp2_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{new_comp2}:{comp3_id}"
                     if avoid_inchikeys and new_name in avoid_inchikeys:
-                        continue
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
                 
+                # Generate neighborhood around comp3_id (keep comp1_id and comp2_id fixed)
                 comp3_range = chain(range(max(1, comp3_id - seen_count * n_samples), comp3_id - (seen_count-1) * n_samples), range(max(1, comp3_id + (seen_count - 1) * n_samples), comp3_id + seen_count * n_samples + 1))
                 for new_comp3 in comp3_range:
                     new_name = f"{rxn_prefix}:{rxn_type}:{comp1_id}:{comp2_id}:{new_comp3}"
                     if avoid_inchikeys and new_name in avoid_inchikeys:
-                        continue
+                        continue  # Skip if this molecule has already been seen
                     names.append(new_name)
 
         except (ValueError, IndexError) as e:
@@ -514,7 +426,7 @@ def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, 
 
 
 class SynthonLibrary:
-    """V8: Ultra-aggressive synthon library with maximum similarity search."""
+    """Manages synthon-based similarity search for component selection using Morgan fingerprints."""
     
     def __init__(self, db_path: str, rxn_id: int):
         self.db_path = db_path
@@ -527,10 +439,12 @@ class SynthonLibrary:
         self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
         self.is_three_component = self.roleC is not None and self.roleC != 0
         
+        # Load all components
         self.molecules_A = get_molecules_by_role(self.roleA, db_path)
         self.molecules_B = get_molecules_by_role(self.roleB, db_path)
         self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
         
+        # Build fingerprint indices
         self.fps_A = self._build_fingerprint_index(self.molecules_A)
         self.fps_B = self._build_fingerprint_index(self.molecules_B)
         self.fps_C = self._build_fingerprint_index(self.molecules_C) if self.is_three_component else {}
@@ -545,6 +459,7 @@ class SynthonLibrary:
         for mol_id, smiles, _ in molecules:
             mol = _mol_from_smiles_cached(smiles)
             if mol:
+                # Use MorganGenerator instead of deprecated method
                 fp = MORGAN_FP_GENERATOR.GetFingerprint(mol)
                 fps[mol_id] = fp
         return fps
@@ -553,18 +468,29 @@ class SynthonLibrary:
         self, 
         target_smiles: str, 
         role: str = 'A',
-        top_k: int = 150,  # V8: Increased from 120
-        min_similarity: float = 0.40  # V8: Lower threshold from 0.45
+        top_k: int = 80,  # BALANCED: Find good number of similar components
+        min_similarity: float = 0.5
     ) -> List[Tuple[int, float]]:
         """
-        V8: Ultra-aggressive component search.
+        Find components similar to target molecule.
+        
+        Args:
+            target_smiles: SMILES string of target molecule
+            role: 'A', 'B', or 'C' - which component pool to search
+            top_k: Number of similar components to return
+            min_similarity: Minimum Tanimoto similarity threshold
+            
+        Returns:
+            List of (component_id, similarity_score) tuples
         """
         target_mol = _mol_from_smiles_cached(target_smiles)
         if not target_mol:
             return []
         
+        # Use MorganGenerator instead of deprecated method
         target_fp = MORGAN_FP_GENERATOR.GetFingerprint(target_mol)
         
+        # Select appropriate fingerprint index
         if role == 'A':
             fps_dict = self.fps_A
         elif role == 'B':
@@ -574,6 +500,7 @@ class SynthonLibrary:
         else:
             return []
         
+        # Calculate similarities - MORE AGGRESSIVE: check all components
         similarities = []
         for mol_id, fp in fps_dict.items():
             try:
@@ -583,6 +510,7 @@ class SynthonLibrary:
             except Exception:
                 continue
         
+        # Sort by similarity and return top_k
         similarities.sort(key=lambda x: x[1], reverse=True)
         return similarities[:top_k]
         
@@ -590,12 +518,22 @@ class SynthonLibrary:
         self,
         molecule_name: str,
         vary_component: str = 'both',
-        top_k_per_component: int = 20,  # V8: Increased from 15
-        min_similarity: float = 0.50  # V8: Lower from 0.55
+        top_k_per_component: int = 10,
+        min_similarity: float = 0.6
     ) -> Dict[str, List[int]]:
         """
-        V8: Find even more similar components per molecule.
+        Given a high-scoring molecule name, find similar components.
+        
+        Args:
+            molecule_name: e.g., "rxn:1:123:456" or "rxn:3:123:456:789"
+            vary_component: 'A', 'B', 'C', 'both', or 'all'
+            top_k_per_component: How many similar components to find per role
+            min_similarity: Minimum similarity threshold
+            
+        Returns:
+            Dict with keys 'A', 'B', 'C' containing lists of similar component IDs
         """
+        # Parse molecule name
         parts = molecule_name.split(":")
         if len(parts) < 4:
             return {}
@@ -611,6 +549,7 @@ class SynthonLibrary:
         except (ValueError, IndexError):
             return {}
         
+        # Get SMILES for each component
         result = {}
         
         if vary_component in ['A', 'both', 'all']:
@@ -662,17 +601,27 @@ class SynthonLibrary:
         min_similarity: float = 0.6
     ) -> List[str]:
         """
-        V8: Ultra-aggressive molecule generation with maximum multipliers.
+        Generate new molecule names by finding similar components to base molecules.
+        ULTIMATE PERFECTED: Maximum variations for top molecules.
+        
+        Args:
+            base_molecule_names: List of high-scoring molecule names
+            n_per_base: How many variations to generate per base molecule
+            min_similarity: Minimum component similarity threshold
+            
+        Returns:
+            List of new molecule names to try
         """
         new_molecules = []
         
-        # V8: Maximum aggression for single molecule
+        # SUPER-AGGRESSIVE: When only one base molecule, MAXIMUM variations
         is_single_molecule = len(base_molecule_names) == 1
+        # For single molecule with high n_per_base, use as-is; otherwise boost significantly
         if is_single_molecule:
-            if n_per_base >= 120:
-                effective_n_per_base = n_per_base
+            if n_per_base >= 80:
+                effective_n_per_base = n_per_base  # Already maximum
             else:
-                effective_n_per_base = n_per_base * 7  # V8: Increased from 5x to 7x
+                effective_n_per_base = n_per_base * 3  # 3x multiplier for single top molecule - BALANCED
         else:
             effective_n_per_base = n_per_base
         
@@ -686,13 +635,16 @@ class SynthonLibrary:
                     _, rxn, A_id, B_id = parts
                     A_id, B_id = int(A_id), int(B_id)
                     
+                    # Find similar components - PERFECTED: find more for single molecule
                     similar_comps = self.find_similar_to_molecule_name(
                         base_name, 'both', effective_n_per_base, min_similarity
                     )
                     
+                    # Generate variations by replacing A
                     for new_A in similar_comps.get('A', [])[:effective_n_per_base]:
                         new_molecules.append(f"rxn:{rxn}:{new_A}:{B_id}")
                     
+                    # Generate variations by replacing B
                     for new_B in similar_comps.get('B', [])[:effective_n_per_base]:
                         new_molecules.append(f"rxn:{rxn}:{A_id}:{new_B}")
                 
@@ -704,6 +656,7 @@ class SynthonLibrary:
                         base_name, 'all', effective_n_per_base, min_similarity
                     )
                     
+                    # Generate variations
                     for new_A in similar_comps.get('A', [])[:effective_n_per_base]:
                         new_molecules.append(f"rxn:{rxn}:{new_A}:{B_id}:{C_id}")
                     
@@ -717,6 +670,7 @@ class SynthonLibrary:
                 bt.logging.warning(f"Could not parse molecule name {base_name}: {e}")
                 continue
         
+        # Remove duplicates while preserving order
         return list(dict.fromkeys(new_molecules))
 
 
@@ -728,23 +682,38 @@ def generate_molecules_from_synthon_library(
     n_per_base: int = 10
 ) -> pd.DataFrame:
     """
-    V8: Ultra-aggressive exploitation of top molecules.
+    Generate new molecules using synthon similarity search.
+    ULTIMATE PERFECTED: Maximum exploitation of top molecules.
+    
+    Args:
+        synthon_lib: Initialized SynthonLibrary
+        top_molecules: DataFrame with top-scoring molecules
+        n_samples: Target number of molecules to generate
+        min_similarity: Minimum component similarity
+        n_per_base: Variations per base molecule
+        
+    Returns:
+        DataFrame with new molecule names
     """
     if top_molecules.empty:
         return pd.DataFrame(columns=["name"])
     
-    # V8: Maximum aggression for single molecule
+    # SUPER-AGGRESSIVE: When only 1 molecule, MAXIMUM exploitation
     if len(top_molecules) == 1:
+        # Single molecule: generate MAXIMUM variations
         seed_names = top_molecules["name"].tolist()
-        if n_per_base >= 120:
-            effective_n_per_base = n_per_base
+        # SUPER-AGGRESSIVE: For single top molecule, use 4x variations if n_per_base is high
+        if n_per_base >= 80:
+            effective_n_per_base = n_per_base  # Already high, use as-is
         else:
-            effective_n_per_base = n_per_base * 8  # V8: Increased from 6x to 8x
+            effective_n_per_base = n_per_base * 4  # 4x multiplier for single molecule - SUPER-AGGRESSIVE
     else:
-        n_seeds = min(50, len(top_molecules))  # V8: Increased from 40
+        # Multiple molecules: use appropriate number
+        n_seeds = min(30, len(top_molecules))  # More seeds like model1
         seed_names = top_molecules.head(n_seeds)["name"].tolist()
         effective_n_per_base = n_per_base
     
+    # Generate similar molecules
     new_names = synthon_lib.generate_similar_molecules(
         seed_names,
         n_per_base=effective_n_per_base,
@@ -754,9 +723,9 @@ def generate_molecules_from_synthon_library(
     if not new_names:
         return pd.DataFrame(columns=["name"])
     
-    # V8: Keep maximum variations
-    if len(new_names) > n_samples * 5.0:  # V8: Increased from 4.0
-        new_names = random.sample(new_names, int(n_samples * 4.0))  # V8: Keep even more
+    # SUPER-AGGRESSIVE: Keep all high-quality variations, only sample if excessive
+    if len(new_names) > n_samples * 3.0:  # Allow more overflow
+        new_names = random.sample(new_names, int(n_samples * 2.0))  # Keep more
     
     return pd.DataFrame({"name": new_names})
 
@@ -851,7 +820,7 @@ def generate_valid_random_molecules_batch(
             continue
             
         batch_df = pd.DataFrame({"name": batch_molecules})
-        batch_df = batch_df[batch_df["name"].notna()]
+        batch_df = batch_df[batch_df["name"].notna()]  # Remove None values
         if batch_df.empty:
             continue
             
@@ -880,6 +849,7 @@ def generate_valid_random_molecules_batch(
     if not valid_dfs:
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
     
+    # Concatenate all DataFrames at once
     result_df = pd.concat(valid_dfs, ignore_index=True)
     return result_df.head(n_samples).copy()
 
@@ -894,11 +864,14 @@ def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple],
     B_ids = [b[0] for b in molecules_B]
     C_ids = [c[0] for c in molecules_C] if is_three_component else None
     
+    # Use weighted sampling if component weights are provided
     if component_weights:
+        # Build weights for each component pool
         weights_A = [component_weights.get('A', {}).get(aid, 1.0) for aid in A_ids]
         weights_B = [component_weights.get('B', {}).get(bid, 1.0) for bid in B_ids]
         weights_C = [component_weights.get('C', {}).get(cid, 1.0) for cid in C_ids] if is_three_component else None
         
+        # Normalize weights
         if weights_A:
             sum_w = sum(weights_A)
             weights_A = [w / sum_w if sum_w > 0 else 1.0/len(weights_A) for w in weights_A]
@@ -917,6 +890,7 @@ def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple],
         else:
             names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
     else:
+        # Uniform random sampling
         picks_A = rng.choices(A_ids, k=n)
         picks_B = rng.choices(B_ids, k=n)
         if is_three_component:
@@ -925,10 +899,12 @@ def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple],
         else:
             names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
     
+    # Remove duplicates while preserving order
     names = list(dict.fromkeys(names))
     return names
 
 def _parse_components(name: str) -> tuple[int, int, int | None]:
+    # name format: "rxn:{rxn_id}:{A}:{B}" or "rxn:{rxn_id}:{A}:{B}:{C}"
     parts = name.split(":")
     if len(parts) < 4:
         return None, None, None
@@ -978,6 +954,7 @@ def generate_offspring_from_elites(rxn_id: int, n: int,
             else:
                 name = f"rxn:{rxn_id}:{A}:{B}"
 
+            # Fast checks first (set membership is O(1))
             if avoid_names and name in avoid_names:
                 continue
             if name in local_names:
@@ -1010,26 +987,29 @@ def generate_offspring_from_elites(rxn_id: int, n: int,
             avoid_names.add(cand)
     return out
 
-def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.55) -> pd.DataFrame:
+def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.65) -> pd.DataFrame:
     """
-    V8: Even lower threshold to include maximum diverse candidates.
+    Select diverse elite molecules: top by score, but ensure diversity in component space.
+    ENHANCED: Lower threshold to include more candidates, better diversity.
     """
     if top_pool.empty or n_elites <= 0:
         return pd.DataFrame()
     
-    # V8: Take maximum top candidates
-    top_candidates = top_pool.head(min(len(top_pool), n_elites * 6))  # V8: Increased from 5
+    # Take MORE top candidates for better diversity selection
+    top_candidates = top_pool.head(min(len(top_pool), n_elites * 4))  # Increased from 3
     if len(top_candidates) <= n_elites:
         return top_candidates
     
-    # V8: Even lower threshold
+    # Score threshold: LOWER threshold to include more candidates
     max_score = top_candidates['score'].max()
-    threshold = max_score * min_score_ratio  # V8: Lower from 0.60
+    threshold = max_score * min_score_ratio
     candidates = top_candidates[top_candidates['score'] >= threshold]
     
+    # Select diverse set: prefer molecules with different components
     selected = []
     used_components = {'A': set(), 'B': set(), 'C': set()}
     
+    # First, add top scorer
     if not candidates.empty:
         top_idx = candidates.index[0]
         top_row = candidates.iloc[0]
@@ -1044,6 +1024,7 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
             except (ValueError, IndexError):
                 pass
     
+    # Then add diverse molecules - MORE AGGRESSIVE diversity selection
     for idx, row in candidates.iterrows():
         if len(selected) >= n_elites:
             break
@@ -1057,12 +1038,13 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
                 B_id = int(parts[3])
                 C_id = int(parts[4]) if len(parts) > 4 else None
                 
+                # Prefer molecules with new components - MORE AGGRESSIVE
                 is_diverse = (A_id not in used_components['A'] or 
                              B_id not in used_components['B'] or
                              (C_id is not None and C_id not in used_components['C']))
                 
-                # V8: Maximum diversity threshold
-                if is_diverse or len(selected) < n_elites * 0.75:  # V8: Increased from 0.7
+                # Lower threshold for diversity - include more diverse molecules
+                if is_diverse or len(selected) < n_elites * 0.6:  # Increased from 0.5
                     selected.append(idx)
                     used_components['A'].add(A_id)
                     used_components['B'].add(B_id)
@@ -1072,6 +1054,7 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
                 if len(selected) < n_elites:
                     selected.append(idx)
     
+    # Fill remaining slots
     for idx, row in candidates.iterrows():
         if len(selected) >= n_elites:
             break
@@ -1083,7 +1066,9 @@ def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio
 
 def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Dict[int, float]]:
     """
-    V8: Maximum exponential weighting for top molecules.
+    Build component weights based on scores of molecules containing them.
+    ENHANCED: Use exponential weighting for top molecules to emphasize best components.
+    Returns dict with 'A', 'B', 'C' keys mapping to {component_id: weight}
     """
     weights = {'A': defaultdict(float), 'B': defaultdict(float), 'C': defaultdict(float)}
     counts = {'A': defaultdict(int), 'B': defaultdict(int), 'C': defaultdict(int)}
@@ -1091,15 +1076,18 @@ def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Di
     if top_pool.empty:
         return weights
     
+    # Get max score for normalization
     max_score = top_pool['score'].max() if not top_pool.empty else 1.0
     
-    # V8: Maximum exponential weighting - rank 1 gets weight 4.0
+    # Extract component IDs and scores with EXPONENTIAL weighting for top molecules
     for idx, row in top_pool.iterrows():
         name = row['name']
         score = row['score']
         
+        # BALANCED exponential weighting: top molecules contribute more but not excessively
+        # Rank-based exponential: rank 1 gets weight 2.5, rank 10 gets weight 1.2, etc.
         rank = idx + 1
-        rank_weight = 4.0 * math.exp(-rank / 12.0)  # V8: Even stronger decay (12 vs 15)
+        rank_weight = 2.5 * math.exp(-rank / 18.0)  # Balanced exponential decay
         weighted_score = max(0, score) * rank_weight
         
         parts = name.split(":")
@@ -1119,11 +1107,13 @@ def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Di
             except (ValueError, IndexError):
                 continue
     
-    # V8: Minimal smoothing to preserve maximum boost
+    # Normalize by count and add smoothing - but preserve exponential weighting
     for role in ['A', 'B', 'C']:
         for comp_id in weights[role]:
             if counts[role][comp_id] > 0:
+                # Average with exponential weighting preserved
                 avg_weight = weights[role][comp_id] / counts[role][comp_id]
-                weights[role][comp_id] = avg_weight + 0.05  # V8: Reduced from 0.10
+                # Add smoothing but keep the exponential boost
+                weights[role][comp_id] = avg_weight + 0.15  # Balanced smoothing
     
     return weights
