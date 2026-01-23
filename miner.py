@@ -19,7 +19,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 
 from nova_ph2.PSICHIC.wrapper import PsichicWrapper
 from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
-from moleculesv8 import (
+from moleculesv3 import (
     generate_valid_random_molecules_batch,
     select_diverse_elites,
     build_component_weights,
@@ -29,9 +29,7 @@ from moleculesv8 import (
     SynthonLibrary,
     generate_molecules_from_synthon_library,
     validate_molecules,
-    ComponentSynergyMatrix,
-    cluster_molecules,
-    compute_quality_score,
+    select_similar_molecules
 )
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
@@ -174,183 +172,171 @@ def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=
 
 
 def main(config: dict):
+    # MINER V3: minerv1 strategy + select_similar_molecules in final stage (last 600s)
     base_n_samples = 1200
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     iteration = 0
+    
     mutation_prob = 0.5
     elite_frac = 0.4
+    
     seen_inchikeys = set()
     seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
+    sim_seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])  # For advanced similarity search
+    
     start = time.time()
     prev_avg_score = None
     current_avg_score = None
     score_improvement_rate = 0.0
     no_improvement_counter = 0
+    
     synthon_lib = None
     use_synthon_search = False
-    best_molecules_history = []
+    
     max_score_history = []
-    synergy_matrix = ComponentSynergyMatrix()
-    last_top1_molecule = None  # V8: Track top-1 for ultra-intensive exploitation
-    last_top3_molecules = set()  # V8: Track top-3 for multi-level exploitation
-    bt.logging.info("[V8] Ultra-aggressive tracking initialized: Synergy Matrix with 75% max synergy")
+    
+    # Track GPU timing for final stage optimization
+    total_gpu_time = 0.0
+    total_gpu_run = 0
+    
+    # Enhanced first iteration - good exploration
     n_samples_first_iteration = base_n_samples * 6 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 3
 
-    with ProcessPoolExecutor(max_workers=3) as cpu_executor:
+    # Use 3 CPU workers for parallel exploration (increased for final stage)
+    with ProcessPoolExecutor(max_workers=5) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
+            
+            # Adaptive n_samples: maintain good throughput
             remaining_time = 1800 - (time.time() - start)
-            if remaining_time > 1500:
-                n_samples = base_n_samples
-            elif remaining_time > 900:
-                n_samples = int(base_n_samples * 0.95)
-            elif remaining_time > 600:
-                n_samples = int(base_n_samples * 0.90)
-            elif remaining_time > 300:
-                n_samples = int(base_n_samples * 0.85)
-            else:
-                n_samples = int(base_n_samples * 0.80)
             
-            if iteration == 2 and not top_pool.empty and synthon_lib is None:
-                try:
-                    bt.logging.info("[Miner] Building synthon library from top molecules...")
-                    synthon_lib_start = time.time()
-                    synthon_lib = SynthonLibrary(DB_PATH, rxn_id)
-                    use_synthon_search = True
-                    bt.logging.info(f"[Miner] Synthon library ready! Built in {time.time() - synthon_lib_start:.2f}s")
-                except Exception as e:
-                    bt.logging.warning(f"[Miner] Could not build synthon library: {e}")
-                    use_synthon_search = False
-
-            component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
-            elite_df = select_diverse_elites(top_pool, min(150, len(top_pool))) if not top_pool.empty else pd.DataFrame()
-            elite_names = elite_df["name"].tolist() if not elite_df.empty else None
-            
-            # V8: Ultra-aggressive top-1 and top-3 exploitation
-            current_top1 = top_pool.head(1)['name'].tolist()[0] if not top_pool.empty else None
-            current_top3 = set(top_pool.head(3)['name'].tolist()) if not top_pool.empty else set()
-            
-            if current_top1 and current_top1 != last_top1_molecule and use_synthon_search and synthon_lib is not None:
-                bt.logging.info(f"[V8-BURST] New top-1 molecule detected! Triggering ULTRA-intensive local search")
-                try:
-                    top1_score = top_pool.head(1)['score'].iloc[0]
-                    if top1_score > 0.008:  # V8: Lower threshold (0.008 vs 0.01)
-                        # V8: Ultra-aggressive - 45% budget for top-1
-                        burst_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(1),
-                            n_samples=int(n_samples * 0.45),  # V8: Increased from 30%
-                            min_similarity=0.90,  # V8: Even tighter (0.90 vs 0.88)
-                            n_per_base=150  # V8: Ultra-high (150 vs 100)
-                        )
-                        if not burst_df.empty:
-                            burst_df = validate_molecules(burst_df, config)
-                        if not burst_df.empty:
-                            if seed_df.empty:
-                                seed_df = burst_df.copy()
-                            else:
-                                seed_df = pd.concat([seed_df, burst_df], ignore_index=True)
-                            bt.logging.info(f"[V8-BURST] Added {len(burst_df)} ULTRA-intensive candidates for top-1")
-                except Exception as e:
-                    bt.logging.warning(f"[V8-BURST] Failed: {e}")
-                last_top1_molecule = current_top1
-            
-            # V8: Also exploit top-3 changes aggressively
-            new_top3 = current_top3 - last_top3_molecules
-            if new_top3 and use_synthon_search and synthon_lib is not None:
-                bt.logging.info(f"[V8-BURST] New top-3 molecules detected! Triggering intensive search")
-                for mol_name in new_top3:
-                    try:
-                        mol_data = top_pool[top_pool['name'] == mol_name].iloc[0]
-                        if mol_data['score'] > 0.008:
-                            burst_df = generate_molecules_from_synthon_library(
-                                synthon_lib,
-                                pd.DataFrame({'name': [mol_name], 'smiles': [mol_data['smiles']], 'InChIKey': [mol_data['InChIKey']]}),
-                                n_samples=int(n_samples * 0.15),  # V8: 15% per top-3 molecule
-                                min_similarity=0.88,
-                                n_per_base=100
-                            )
-                            if not burst_df.empty:
-                                burst_df = validate_molecules(burst_df, config)
-                            if not burst_df.empty:
-                                if seed_df.empty:
-                                    seed_df = burst_df.copy()
-                                else:
-                                    seed_df = pd.concat([seed_df, burst_df], ignore_index=True)
-                                bt.logging.info(f"[V8-BURST] Added {len(burst_df)} candidates for top-3 {mol_name}")
-                    except Exception as e:
-                        bt.logging.warning(f"[V8-BURST] Failed for {mol_name}: {e}")
-                last_top3_molecules = current_top3
-            
-            if no_improvement_counter >= 5:
-                bt.logging.info(f"[V8-RESTART] Triggering diversity restart (stuck for {no_improvement_counter} iterations)")
-                elite_memory = top_pool.head(20).copy()
-                bt.logging.info(f"[V8-RESTART] Saved top 20 elites (avg: {elite_memory['score'].mean():.4f})")
-                restart_candidates = []
+            # NEW: Check if we're in final stage (last 300-600 seconds) - use advanced similarity search
+            if remaining_time <= 600 and not top_pool.empty:
+                bt.logging.info(f"[Miner V3] ===== FINAL STAGE: Advanced similarity search (remaining: {remaining_time:.0f}s) =====")
                 
-                if use_synthon_search and synthon_lib is not None:
-                    try:
-                        pop_A_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(10),
-                            n_samples=int(n_samples * 0.50),  # V8: Increased from 40%
-                            min_similarity=0.75,
-                            n_per_base=40  # V8: Increased from 30
-                        )
-                        if not pop_A_df.empty:
-                            pop_A_df = validate_molecules(pop_A_df, config)
-                            restart_candidates.append(pop_A_df)
-                            bt.logging.info(f"[V8-RESTART] Pop A (tight): {len(pop_A_df)} candidates")
-                    except Exception as e:
-                        bt.logging.warning(f"[V8-RESTART] Pop A failed: {e}")
+                # Launch advanced similarity searches for top 5 molecules
+                sim_cpu_futures = []
                 
-                if use_synthon_search and synthon_lib is not None and len(top_pool) >= 60:
-                    try:
-                        pop_B_seeds = top_pool.iloc[20:60]
-                        pop_B_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            pop_B_seeds,
-                            n_samples=int(n_samples * 0.25),
-                            min_similarity=0.50,
-                            n_per_base=25  # V8: Increased from 18
-                        )
-                        if not pop_B_df.empty:
-                            pop_B_df = validate_molecules(pop_B_df, config)
-                            restart_candidates.append(pop_B_df)
-                            bt.logging.info(f"[V8-RESTART] Pop B (medium): {len(pop_B_df)} candidates")
-                    except Exception as e:
-                        bt.logging.warning(f"[V8-RESTART] Pop B failed: {e}")
+                # Remove already seen molecules from sim_seed_df
+                if not sim_seed_df.empty:
+                    sim_seed_df = sim_seed_df[~sim_seed_df["InChIKey"].isin(seen_inchikeys)]
                 
-                try:
-                    pop_C_df = generate_valid_random_molecules_batch(
-                        rxn_id,
-                        n_samples=int(n_samples * 1.5),
-                        db_path=DB_PATH,
-                        subnet_config=config,
-                        batch_size=400,
-                        elite_names=None,
-                        elite_frac=0.0,
-                        mutation_prob=1.0,
-                        avoid_inchikeys=seen_inchikeys,
-                        component_weights=None,
-                    )
-                    if not pop_C_df.empty:
-                        restart_candidates.append(pop_C_df)
-                        bt.logging.info(f"[V8-RESTART] Pop C (random): {len(pop_C_df)} candidates")
-                except Exception as e:
-                    bt.logging.warning(f"[V8-RESTART] Pop C failed: {e}")
-                
-                if restart_candidates:
-                    data = pd.concat(restart_candidates, ignore_index=True)
-                    data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[V8-RESTART] Total restart candidates: {len(data)}")
+                # Calculate how many molecules we can score in remaining time
+                if total_gpu_run > 0:
+                    avg_gpu_time_per_mol = total_gpu_time / total_gpu_run
+                    total_run_capacity = int(len(sim_seed_df) * 0.9 * avg_gpu_time_per_mol // 1)
+                    if len(sim_seed_df) * avg_gpu_time_per_mol < 10:
+                        total_run_capacity = 10
                 else:
-                    bt.logging.warning(f"[V8-RESTART] All populations failed, using fallback")
+                    total_run_capacity = 10
+                
+                bt.logging.info(f"[Miner V3] Estimated GPU capacity for iteration {iteration}: {total_run_capacity} molecules")
+                
+                # Launch similarity searches for top 5 molecules
+                n_similar_per_mol = 3000 if total_run_capacity > 17 else 1600
+                for i in range(min(5, len(top_pool))):
+                    sim_cpu_futures.append((
+                        cpu_executor.submit(
+                            select_similar_molecules, 
+                            iteration, 
+                            i, 
+                            top_pool.iloc[i],
+                            n_similar_per_mol,  # Number of candidates to sample
+                            0.95,  # High similarity threshold
+                            DB_PATH, 
+                            rxn_id, 
+                            config
+                        ), 
+                        f"similar-top{i+1}"
+                    ))
+                
+                # Score molecules from previous iteration's similarity search
+                gpu_start_time = time.time()
+                
+                if not sim_seed_df.empty:
+                    bt.logging.info(f"[Miner V3] Scoring {len(sim_seed_df)} similar molecules from previous iteration")
+                    sim_seed_df['Target'] = target_score_from_data(sim_seed_df['smiles'])
+                    sim_seed_df['Anti'] = antitarget_scores()
+                    sim_seed_df['score'] = sim_seed_df['Target'] - (config["antitarget_weight"] * sim_seed_df['Anti'])
+                    sim_seed_df = sim_seed_df.sort_values(by="score", ascending=False).head(config["num_molecules"])
+                    seen_inchikeys.update([k for k in sim_seed_df["InChIKey"].tolist() if k])
+
+                    top_pool = pd.concat([top_pool, sim_seed_df], ignore_index=True)
+                    top_pool = top_pool.sort_values(by="score", ascending=False)
+                    top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
+                    
+                    bt.logging.info(f"[Miner V3] Top score after similarity search: {top_pool['score'].max():.6f}")
+                    sim_seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+                
+                gpu_time = time.time() - gpu_start_time
+                
+                # Sleep if GPU time was too fast to maintain steady state
+                if gpu_time < 10:
+                    sleep_time = 10 - gpu_time
+                    bt.logging.info(f"[Miner V3] GPU scoring completed in {gpu_time:.2f}s, sleeping {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+                
+                total_gpu_time += gpu_time
+                total_gpu_run += len(sim_seed_df) if not sim_seed_df.empty else 0
+                
+                # Collect similarity search results for next iteration
+                if sim_cpu_futures:
+                    for cpu_future, strategy_name in sim_cpu_futures:
+                        try:
+                            cpu_df = cpu_future.result(timeout=0)
+                            if not cpu_df.empty:
+                                if sim_seed_df.empty:
+                                    sim_seed_df = cpu_df.copy()
+                                else:
+                                    sim_seed_df = pd.concat([sim_seed_df, cpu_df], ignore_index=True)
+                                bt.logging.info(f"[Miner V3] CPU similarity ({strategy_name}) found {len(cpu_df)} candidates")
+                        except TimeoutError:
+                            pass
+                        except Exception as e:
+                            bt.logging.warning(f"[Miner V3] CPU similarity ({strategy_name}) failed: {e}")
+                    
+                    if not sim_seed_df.empty:
+                        sim_seed_df = sim_seed_df.drop_duplicates(subset=["InChIKey"], keep="first")
+                        bt.logging.info(f"[Miner V3] Total similarity candidates for next iteration: {len(sim_seed_df)}")
+                
+            else:
+                # STANDARD STAGE: Use minerv1 strategy
+                if remaining_time > 1500:
+                    n_samples = base_n_samples
+                elif remaining_time > 900:
+                    n_samples = int(base_n_samples * 0.95)
+                elif remaining_time > 600:
+                    n_samples = int(base_n_samples * 0.90)
+                elif remaining_time > 300:
+                    n_samples = int(base_n_samples * 0.85)
+                else:
+                    n_samples = int(base_n_samples * 0.80)
+                
+                # Build synthon library after first iteration
+                if iteration == 2 and not top_pool.empty and synthon_lib is None:
+                    try:
+                        bt.logging.info("[Miner] Building synthon library from top molecules...")
+                        synthon_lib_start = time.time()
+                        synthon_lib = SynthonLibrary(DB_PATH, rxn_id)
+                        use_synthon_search = True
+                        bt.logging.info(f"[Miner] Synthon library ready! Built in {time.time() - synthon_lib_start:.2f}s")
+                    except Exception as e:
+                        bt.logging.warning(f"[Miner] Could not build synthon library: {e}")
+                        use_synthon_search = False
+
+                component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
+                # Enhanced elite pool
+                elite_df = select_diverse_elites(top_pool, min(150, len(top_pool))) if not top_pool.empty else pd.DataFrame()
+                elite_names = elite_df["name"].tolist() if not elite_df.empty else None
+                
+                # WINNING STRATEGY: Intelligent exploration/exploitation balance
+                if iteration == 1:
+                    bt.logging.info(f"[Miner] Iteration {iteration}: Initial broad random sampling")
                     data = generate_valid_random_molecules_batch(
                         rxn_id,
-                        n_samples=n_samples * 2,
+                        n_samples=n_samples_first_iteration,
                         db_path=DB_PATH,
                         subnet_config=config,
                         batch_size=400,
@@ -361,145 +347,61 @@ def main(config: dict):
                         component_weights=None,
                     )
                 
-                no_improvement_counter = 0
-                seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-            
-            elif iteration == 1:
-                bt.logging.info(f"[Miner] Iteration {iteration}: Initial broad random sampling")
-                data = generate_valid_random_molecules_batch(
-                    rxn_id,
-                    n_samples=n_samples_first_iteration,
-                    db_path=DB_PATH,
-                    subnet_config=config,
-                    batch_size=400,
-                    elite_names=None,
-                    elite_frac=0.0,
-                    mutation_prob=1.0,
-                    avoid_inchikeys=seen_inchikeys,
-                    component_weights=None,
-                )
-            
-            elif use_synthon_search and iteration > 2 and not top_pool.empty:
-                bt.logging.info(f"[Miner] Iteration {iteration}: V8 ULTRA-AGGRESSIVE synthon similarity search")
-                current_max_score = top_pool['score'].max() if not top_pool.empty else None
-                current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
-                max_score_history.append(current_max_score)
-                if len(max_score_history) > 5:
-                    max_score_history.pop(0)
-                
-                has_very_high_score = current_max_score is not None and current_max_score > 0.015
-                time_elapsed = time.time() - start
-                is_very_late_stage = time_elapsed > 1500
-                
-                # V8: Ultra-aggressive thresholds and maximum n_per_base
-                if score_improvement_rate > 0.05:
-                    sim_threshold = 0.75
-                    n_per_base = 30  # V8: Increased from 20
-                    n_seeds = 20
-                    synthon_ratio = 0.85  # V8: Increased from 0.80
-                    bt.logging.info(f"[V8] High improvement ({score_improvement_rate:.4f}), ULTRA-aggressive exploitation")
-                
-                elif score_improvement_rate > 0.02:
-                    sim_threshold = 0.70
-                    n_per_base = 35  # V8: Increased from 25
-                    n_seeds = 25
-                    synthon_ratio = 0.85  # V8: Increased from 0.80
-                    bt.logging.info(f"[V8] Good improvement ({score_improvement_rate:.4f}), medium-tight similarity")
-                
-                elif score_improvement_rate > 0.005:
-                    sim_threshold = 0.65
-                    n_per_base = 35  # V8: Increased from 25
-                    n_seeds = 40  # V8: Increased from 35
-                    synthon_ratio = 0.80  # V8: Increased from 0.75
-                    bt.logging.info(f"[V8] Moderate improvement ({score_improvement_rate:.4f}), medium similarity")
-                
-                else:
-                    bt.logging.info(f"[V8] Low improvement ({score_improvement_rate:.4f}), using ULTRA-AGGRESSIVE MULTI-RANGE strategy")
-                    if has_very_high_score or is_very_late_stage:
-                        # V8: Ultra-aggressive top-1 exploitation
-                        n_synthon_top1 = int(n_samples * 0.30)  # V8: Increased from 0.25
+                elif use_synthon_search and iteration > 2 and not top_pool.empty:
+                    # Check if we're approaching the final stage - prepare for similarity search
+                    if remaining_time <= 800:
+                        bt.logging.info(f"[Miner V3] Iteration {iteration}: PRE-FINAL STAGE - Intensive top-1 strategy + launching similarity search")
+                        
+                        # Launch similarity searches early (in background)
+                        sim_cpu_futures = []
+                        for i in range(min(5, len(top_pool))):
+                            sim_cpu_futures.append((
+                                cpu_executor.submit(
+                                    select_similar_molecules, 
+                                    iteration, 
+                                    i, 
+                                    top_pool.iloc[i],
+                                    1000,
+                                    0.95,
+                                    DB_PATH, 
+                                    rxn_id, 
+                                    config
+                                ), 
+                                f"similar-top{i+1}-prefinal"
+                            ))
+                        
+                        # Extreme top-1 strategy from minerv1
+                        n_synthon_top1 = int(n_samples * 0.49)
                         synthon_top1_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(1),
                             n_synthon_top1,
-                            min_similarity=0.90,  # V8: Increased from 0.88
-                            n_per_base=120  # V8: Increased from 80
+                            min_similarity=0.92,
+                            n_per_base=200
                         )
-                        bt.logging.info(f"[V8] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.90)")
+                        bt.logging.info(f"[Miner] Generated {len(synthon_top1_df)} EXTREME TOP-1 (sim=0.92, n=200)")
                         
-                        n_synthon_tight = int(n_samples * 0.10)  # V8: Increased from 0.08
+                        n_synthon_top2 = int(n_samples * 0.084)
+                        synthon_top2_df = generate_molecules_from_synthon_library(
+                            synthon_lib,
+                            top_pool.iloc[1:2],
+                            n_synthon_top2,
+                            min_similarity=0.88,
+                            n_per_base=85
+                        )
+                        bt.logging.info(f"[Miner] Generated {len(synthon_top2_df)} EXTREME TOP-2 (sim=0.88)")
+                        
+                        n_synthon_tight = int(n_samples * 0.056)
                         synthon_tight_df = generate_molecules_from_synthon_library(
                             synthon_lib,
-                            top_pool.head(5),
+                            top_pool.iloc[2:6],
                             n_synthon_tight,
-                            min_similarity=0.85,  # V8: Increased from 0.82
-                            n_per_base=50  # V8: Increased from 40
+                            min_similarity=0.80,
+                            n_per_base=38
                         )
-                        bt.logging.info(f"[V8] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.85)")
+                        bt.logging.info(f"[Miner] Generated {len(synthon_tight_df)} TIGHT TOP-3-6 (sim=0.80)")
                         
-                        n_synthon_medium = int(n_samples * 0.25)  # V8: Increased from 0.22
-                        seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
-                        synthon_medium_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            seed_medium,
-                            n_synthon_medium,
-                            min_similarity=0.55,
-                            n_per_base=30  # V8: Increased from 20
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
-                        
-                        n_synthon_broad = int(n_samples * 0.20)
-                        synthon_broad_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(50),
-                            n_synthon_broad,
-                            min_similarity=0.40, 
-                            n_per_base=30  # V8: Increased from 25
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
-                        
-                        synthon_df = pd.concat([synthon_top1_df, synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
-                    else:
-                        n_synthon_tight = int(n_samples * 0.35)  # V8: Increased from 0.30
-                        synthon_tight_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(5),
-                            n_synthon_tight,
-                            min_similarity=0.85,  # V8: Increased from 0.82
-                            n_per_base=50  # V8: Increased from 40
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.85)")
-                        
-                        n_synthon_medium = int(n_samples * 0.25)  # V8: Increased from 0.22
-                        seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
-                        synthon_medium_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            seed_medium,
-                            n_synthon_medium,
-                            min_similarity=0.55,
-                            n_per_base=30  # V8: Increased from 20
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
-                        n_synthon_broad = int(n_samples * 0.25)  # V8: Increased from 0.23
-                        synthon_broad_df = generate_molecules_from_synthon_library(
-                            synthon_lib,
-                            top_pool.head(50),
-                            n_synthon_broad,
-                            min_similarity=0.40,
-                            n_per_base=30  # V8: Increased from 25
-                        )
-                        bt.logging.info(f"[V8] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
-                        
-                        synthon_df = pd.concat([synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
-                    
-                    synthon_df = synthon_df.drop_duplicates(subset=["name"], keep="first")
-                    
-                    if not synthon_df.empty:
-                        synthon_df = validate_molecules(synthon_df, config)
-                        bt.logging.info(f"[V8] {len(synthon_df)} multi-range synthon candidates passed validation")
-                    
-                    n_traditional = n_samples - len(synthon_df)
-                    if n_traditional > 0:
+                        n_traditional = int(n_samples * 0.07)
                         traditional_df = generate_valid_random_molecules_batch(
                             rxn_id,
                             n_samples=n_traditional,
@@ -507,249 +409,371 @@ def main(config: dict):
                             subnet_config=config,
                             batch_size=400,
                             elite_names=elite_names,
-                            elite_frac=elite_frac,
-                            mutation_prob=mutation_prob,
+                            elite_frac=0.90,
+                            mutation_prob=0.10,
                             avoid_inchikeys=seen_inchikeys,
                             component_weights=component_weights,
                         )
-                    else:
-                        traditional_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
-                    
-                    data = pd.concat([synthon_df, traditional_df], ignore_index=True)
-                    data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[V8] Combined: {len(data)} total ({len(synthon_df)} multi-range synthon + {len(traditional_df)} GA)")
-                    synthon_df = None
-                
-                if score_improvement_rate > 0.005:
-                    n_synthon = int(n_samples * synthon_ratio)
-                    synthon_gen_start = time.time()
-                    synthon_df = generate_molecules_from_synthon_library(
-                        synthon_lib,
-                        top_pool.head(n_seeds),
-                        n_synthon,
-                        min_similarity=sim_threshold,
-                        n_per_base=n_per_base
-                    )
-                    bt.logging.info(f"[V8] Generated {len(synthon_df)} synthon candidates in {time.time() - synthon_gen_start:.2f}s")
-                    
-                    n_traditional = n_samples - len(synthon_df)
-                    if n_traditional > 0:
-                        traditional_df = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_traditional,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=300,
-                            elite_names=elite_names,
-                            elite_frac=elite_frac,
-                            mutation_prob=mutation_prob,
-                            avoid_inchikeys=seen_inchikeys,
-                            component_weights=component_weights,
-                        )
-                    else:
-                        traditional_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
-                    
-                    if not synthon_df.empty:
-                        synthon_df = validate_molecules(synthon_df, config)
-                        bt.logging.info(f"[V8] {len(synthon_df)} synthon candidates passed validation")
-                    
-                    data = pd.concat([synthon_df, traditional_df], ignore_index=True)
-                    data = data.drop_duplicates(subset=["name"], keep="first")
-                    bt.logging.info(f"[V8] Combined: {len(data)} total ({len(synthon_df)} synthon + {len(traditional_df)} GA)")
-            
-            elif no_improvement_counter < 3:
-                bt.logging.info(f"[Miner] Iteration {iteration}: Standard genetic algorithm")
-                data = generate_valid_random_molecules_batch(
-                    rxn_id,
-                    n_samples=n_samples,
-                    db_path=DB_PATH,
-                    subnet_config=config,
-                    batch_size=400,
-                    elite_names=elite_names,
-                    elite_frac=elite_frac,
-                    mutation_prob=mutation_prob,
-                    avoid_inchikeys=seen_inchikeys,
-                    component_weights=component_weights,
-                )
-            
-            else:
-                bt.logging.info(f"[Miner] Iteration {iteration}: Exploring similar space (no_improvement={no_improvement_counter})")
-                data = _cpu_random_candidates_with_similarity(
-                    iteration,
-                    30,
-                    config,
-                    top_pool.head(50)[["name", "smiles", "InChIKey"]],
-                    seen_inchikeys,
-                    0.65
-                )
-                seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-            
-            gen_time = time.time() - iter_start_time
-            bt.logging.info(f"[Miner] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)")
-
-            if data.empty:
-                bt.logging.warning(f"[Miner] Iteration {iteration}: No valid molecules produced; continuing")
-                continue
-            
-            if not seed_df.empty:
-                data = pd.concat([data, seed_df])
-                data = data.drop_duplicates(subset=["InChIKey"], keep="first")
-                seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
-
-            try:
-                filterd_data = data[~data["InChIKey"].isin(seen_inchikeys)]
-                if len(filterd_data) < len(data):
-                    bt.logging.warning(
-                        f"[Miner] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen"
-                    )
-
-                dup_ratio = (len(data) - len(filterd_data)) / max(1, len(data))
-                
-                if dup_ratio > 0.7:
-                    mutation_prob = min(0.9, mutation_prob * 1.5)
-                    elite_frac = max(0.15, elite_frac * 0.7)
-                    bt.logging.warning(f"[Miner] SEVERE duplication ({dup_ratio:.2%})! mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                elif dup_ratio > 0.5:
-                    mutation_prob = min(0.7, mutation_prob * 1.3)
-                    elite_frac = max(0.2, elite_frac * 0.8)
-                    bt.logging.warning(f"[Miner] High duplication ({dup_ratio:.2%}), mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                elif dup_ratio < 0.15 and not top_pool.empty and iteration > 10:
-                    mutation_prob = max(0.05, mutation_prob * 0.95)
-                    elite_frac = min(0.85, elite_frac * 1.05)
-
-                data = filterd_data
-
-            except Exception as e:
-                bt.logging.warning(f"[Miner] Pre-score deduplication failed: {e}")
-
-            if data.empty:
-                bt.logging.error(f"[Miner] Iteration {iteration}: ALL molecules were duplicates! Skipping scoring and continuing...")
-                mutation_prob = min(0.95, mutation_prob * 2.0)
-                elite_frac = max(0.1, elite_frac * 0.5)
-                bt.logging.warning(f"[Miner] Emergency diversity boost: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
-                continue  # Skip to next iteration
-
-            data = data.reset_index(drop=True)
-
-            cpu_futures = []
-            if not top_pool.empty and iteration > 3:
-                if score_improvement_rate < 0.01:
-                    cpu_futures.append((
-                        cpu_executor.submit(
-                            _cpu_random_candidates_with_similarity,
-                            iteration,
-                            60,  # V8: Increased from 50
-                            config,
-                            top_pool.head(5)[["name", "smiles", "InChIKey"]],
-                            seen_inchikeys,
-                            0.80
-                        ),
-                        "tight-top5"
-                    ))
-                    
-                    cpu_futures.append((
-                        cpu_executor.submit(
-                            _cpu_random_candidates_with_similarity,
-                            iteration,
-                            50,  # V8: Increased from 40
-                            config,
-                            top_pool.head(20)[["name", "smiles", "InChIKey"]],
-                            seen_inchikeys,
-                            0.65
-                        ),
-                        "medium-top20"
-                    ))
-            
-            gpu_start_time = time.time()
-
-            if len(data) == 0:
-                bt.logging.error(f"[Miner] Iteration {iteration}: No molecules to score! Continuing...")
-                continue
-
-            # V8: Ultra-aggressive quality pre-ranking
-            if iteration > 1 and component_weights and len(data) > 0:  # V8: Start even earlier (iteration > 1)
-                bt.logging.info(f"[V8-QUALITY] Pre-ranking {len(data)} candidates with ULTRA-enhanced quality scoring")
-                try:
-                    original_count = len(data)
-                    data = data.copy()
-                    data['quality'] = data['name'].apply(
-                        lambda x: compute_quality_score(x, component_weights, synergy_matrix)
-                    )
-                    data = data.sort_values('quality', ascending=False)
-                    
-                    # V8: Ultra-aggressive filtering
-                    if len(data) > n_samples * 1.05:  # V8: Even lower threshold (1.05 vs 1.1)
-                        top_n = int(len(data) * 0.80)  # V8: Keep even more top (80% vs 75%)
-                        random_n = int(len(data) * 0.2)  # V8: Even less random (20% vs 30%)
-                        top_candidates = data.head(top_n)
-                        remaining = data.iloc[top_n:]
-                        if len(remaining) > 0:
-                            random_candidates = remaining.sample(n=min(random_n, len(remaining)))
-                            data = pd.concat([top_candidates, random_candidates])
-                        else:
-                            data = top_candidates
+                        bt.logging.info(f"[Miner] Generated {len(traditional_df)} ULTRA-ELITE GA")
                         
-                        bt.logging.info(f"[V8-QUALITY] Filtered to {len(data)} candidates ({top_n} top + {len(data)-top_n} random)")
+                        synthon_df = pd.concat([synthon_top1_df, synthon_top2_df, synthon_tight_df, traditional_df], ignore_index=True)
+                        synthon_df = synthon_df.drop_duplicates(subset=["name"], keep="first")
+                        
+                        if not synthon_df.empty:
+                            synthon_df = validate_molecules(synthon_df, config)
+                            bt.logging.info(f"[Miner] {len(synthon_df)} extreme top-1 synthon candidates passed validation")
+                        
+                        data = synthon_df
+                        bt.logging.info(f"[Miner] Combined: {len(data)} total (extreme top-1 strategy)")
                     
-                    data = data.drop(columns=['quality'])
-                    data = data.reset_index(drop=True)
-                    
-                    if len(data) < original_count:
-                        bt.logging.info(f"[V8-QUALITY] Filtered {original_count - len(data)} low-quality candidates")
-                except Exception as e:
-                    bt.logging.warning(f"[V8-QUALITY] Quality pre-ranking failed: {e}, continuing without filtering")
-
-            data["Target"] = target_score_from_data(data["smiles"])
-            data["Anti"] = antitarget_scores()
-            data["score"] = data["Target"] - (config["antitarget_weight"] * data["Anti"])
-
-            if data["score"].isna().all():
-                bt.logging.error(f"[Miner] Iteration {iteration}: Scoring failed (all NaN)! Continuing...")
-                continue
-            
-            for _, row in data.iterrows():
-                synergy_matrix.update(row['name'], row['score'])
-            
-            gpu_time = time.time() - gpu_start_time
-            bt.logging.info(f"[Miner] Iteration {iteration}: GPU scoring time ~{gpu_time:.2f}s")
-            
-            if cpu_futures:
-                for cpu_future, strategy_name in cpu_futures:
-                    try:
-                        cpu_df = cpu_future.result(timeout=0)
-                        if not cpu_df.empty:
-                            if seed_df.empty:
-                                seed_df = cpu_df.copy()
+                    else:
+                        bt.logging.info(f"[Miner] Iteration {iteration}: Smart synthon similarity search")
+                        current_max_score = top_pool['score'].max() if not top_pool.empty else None
+                        current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+                        has_very_high_score = current_max_score is not None and current_max_score > 0.015
+                        
+                        time_elapsed = time.time() - start
+                        is_late_stage = time_elapsed > 1200
+                        is_very_late_stage = time_elapsed > 1500
+                        
+                        if score_improvement_rate > 0.05:
+                            # High improvement: tight exploration
+                            sim_threshold = 0.75
+                            n_per_base = 15
+                            n_seeds = 20
+                            synthon_ratio = 0.75
+                            bt.logging.info(f"[Miner] High improvement ({score_improvement_rate:.4f}), tight similarity (0.75)")
+                        
+                        elif score_improvement_rate > 0.02:
+                            # Good improvement: medium-tight exploration
+                            sim_threshold = 0.70
+                            n_per_base = 18
+                            n_seeds = 25
+                            synthon_ratio = 0.75
+                            bt.logging.info(f"[Miner] Good improvement ({score_improvement_rate:.4f}), medium-tight similarity (0.70)")
+                        
+                        elif score_improvement_rate > 0.005:
+                            sim_threshold = 0.65
+                            n_per_base = 20
+                            n_seeds = 30
+                            synthon_ratio = 0.70
+                            bt.logging.info(f"[Miner] Moderate improvement ({score_improvement_rate:.4f}), medium similarity (0.65)")
+                        
+                        else:
+                            bt.logging.info(f"[Miner] Low improvement ({score_improvement_rate:.4f}), using PROVEN MULTI-RANGE strategy")
+                            
+                            if has_very_high_score or is_very_late_stage:
+                                n_synthon_top1 = int(n_samples * 0.21)  # 30% of 70%
+                                synthon_top1_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    top_pool.head(1),  # TOP 1 ONLY
+                                    n_synthon_top1,
+                                    min_similarity=0.85,  # Very tight
+                                    n_per_base=50
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.85)")
+                                
+                                n_synthon_tight = int(n_samples * 0.07)  # 10% of 70%
+                                synthon_tight_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    top_pool.head(5),
+                                    n_synthon_tight,
+                                    min_similarity=0.80,  # Tight
+                                    n_per_base=30
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
+                                
+                                n_synthon_medium = int(n_samples * 0.21)  # 30% of 70%
+                                seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
+                                synthon_medium_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    seed_medium,
+                                    n_synthon_medium,
+                                    min_similarity=0.55,  # Medium - like richard1220v3
+                                    n_per_base=15
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
+                                
+                                # Part 4: Broad on top 50 (30% of synthon budget)
+                                n_synthon_broad = int(n_samples * 0.21)  # 30% of 70%
+                                synthon_broad_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    top_pool.head(50),
+                                    n_synthon_broad,
+                                    min_similarity=0.40,  # Broad - like richard1220v3
+                                    n_per_base=20
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
+                                
+                                # Combine all synthon approaches
+                                synthon_df = pd.concat([synthon_top1_df, synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
                             else:
-                                seed_df = pd.concat([seed_df, cpu_df], ignore_index=True)
-                            bt.logging.info(f"[Miner] CPU similarity ({strategy_name}) found {len(cpu_df)} candidates")
-                    except TimeoutError:
-                        pass
-                    except Exception as e:
-                        bt.logging.warning(f"[Miner] CPU similarity ({strategy_name}) failed: {e}")
+                                n_synthon_tight = int(n_samples * 0.28)  # 40% of 70%
+                                synthon_tight_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    top_pool.head(5),
+                                    n_synthon_tight,
+                                    min_similarity=0.80,  # Very tight!
+                                    n_per_base=30
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_tight_df)} TIGHT synthon candidates (sim=0.80)")
+                                
+                                n_synthon_medium = int(n_samples * 0.21)  # 30% of 70%
+                                seed_medium = top_pool.iloc[10:40] if len(top_pool) > 40 else top_pool.iloc[5:]
+                                synthon_medium_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    seed_medium,
+                                    n_synthon_medium,
+                                    min_similarity=0.55,  # Medium - like richard1220v3
+                                    n_per_base=15
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_medium_df)} MEDIUM synthon candidates (sim=0.55)")
+                                
+                                n_synthon_broad = int(n_samples * 0.21)  # 30% of 70%
+                                synthon_broad_df = generate_molecules_from_synthon_library(
+                                    synthon_lib,
+                                    top_pool.head(50),
+                                    n_synthon_broad,
+                                    min_similarity=0.40,  # Broad - like richard1220v3
+                                    n_per_base=20
+                                )
+                                bt.logging.info(f"[Miner] Generated {len(synthon_broad_df)} BROAD synthon candidates (sim=0.40)")
+                                
+                                # Combine all synthon approaches
+                                synthon_df = pd.concat([synthon_tight_df, synthon_medium_df, synthon_broad_df], ignore_index=True)
+                            
+                            synthon_df = synthon_df.drop_duplicates(subset=["name"], keep="first")
+                            
+                            if not synthon_df.empty:
+                                synthon_df = validate_molecules(synthon_df, config)
+                                bt.logging.info(f"[Miner] {len(synthon_df)} multi-range synthon candidates passed validation")
+                            
+                            n_traditional = n_samples - len(synthon_df)
+                            if n_traditional > 0:
+                                traditional_df = generate_valid_random_molecules_batch(
+                                    rxn_id,
+                                    n_samples=n_traditional,
+                                    db_path=DB_PATH,
+                                    subnet_config=config,
+                                    batch_size=400,
+                                    elite_names=elite_names,
+                                    elite_frac=elite_frac,
+                                    mutation_prob=mutation_prob,
+                                    avoid_inchikeys=seen_inchikeys,
+                                    component_weights=component_weights,
+                                )
+                            else:
+                                traditional_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+                            
+                            data = pd.concat([synthon_df, traditional_df], ignore_index=True)
+                            data = data.drop_duplicates(subset=["name"], keep="first")
+                            bt.logging.info(f"[Miner] Combined: {len(data)} total ({len(synthon_df)} multi-range synthon + {len(traditional_df)} GA)")
+                            
+                            # Skip the standard synthon generation below
+                            synthon_df = None
+                        
+                        if score_improvement_rate > 0.005:  # Only if not using multi-range
+                            n_synthon = int(n_samples * synthon_ratio)
+                            synthon_gen_start = time.time()
+                            synthon_df = generate_molecules_from_synthon_library(
+                                synthon_lib,
+                                top_pool.head(n_seeds),
+                                n_synthon,
+                                min_similarity=sim_threshold,
+                                n_per_base=n_per_base
+                            )
+                            bt.logging.info(f"[Miner] Generated {len(synthon_df)} synthon candidates in {time.time() - synthon_gen_start:.2f}s")
+                            
+                            # Generate remaining from traditional method
+                            n_traditional = n_samples - len(synthon_df)
+                            if n_traditional > 0:
+                                traditional_df = generate_valid_random_molecules_batch(
+                                    rxn_id,
+                                    n_samples=n_traditional,
+                                    db_path=DB_PATH,
+                                    subnet_config=config,
+                                    batch_size=300,
+                                    elite_names=elite_names,
+                                    elite_frac=elite_frac,
+                                    mutation_prob=mutation_prob,
+                                    avoid_inchikeys=seen_inchikeys,
+                                    component_weights=component_weights,
+                                )
+                            else:
+                                traditional_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+                            
+                            # Validate and combine
+                            if not synthon_df.empty:
+                                synthon_df = validate_molecules(synthon_df, config)
+                                bt.logging.info(f"[Miner] {len(synthon_df)} synthon candidates passed validation")
+                            
+                            data = pd.concat([synthon_df, traditional_df], ignore_index=True)
+                            data = data.drop_duplicates(subset=["name"], keep="first")
+                            bt.logging.info(f"[Miner] Combined: {len(data)} total ({len(synthon_df)} synthon + {len(traditional_df)} GA)")
+                
+                elif no_improvement_counter < 3:
+                    bt.logging.info(f"[Miner] Iteration {iteration}: Standard genetic algorithm")
+                    data = generate_valid_random_molecules_batch(
+                        rxn_id,
+                        n_samples=n_samples,
+                        db_path=DB_PATH,
+                        subnet_config=config,
+                        batch_size=400,
+                        elite_names=elite_names,
+                        elite_frac=elite_frac,
+                        mutation_prob=mutation_prob,
+                        avoid_inchikeys=seen_inchikeys,
+                        component_weights=component_weights,
+                    )
+                
+                elif no_improvement_counter < 6:
+                    bt.logging.info(f"[Miner] Iteration {iteration}: Exploring similar space (no_improvement={no_improvement_counter})")
+                    data = _cpu_random_candidates_with_similarity(
+                        iteration,
+                        30,
+                        config,
+                        top_pool.head(50)[["name", "smiles", "InChIKey"]],
+                        seen_inchikeys,
+                        0.65
+                    )
+                    seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
+                
+                else:
+                    bt.logging.info(f"[Miner] Iteration {iteration}: Broad exploration reset (no_improvement={no_improvement_counter})")
+                    data = _cpu_random_candidates_with_similarity(
+                        iteration,
+                        40,
+                        config,
+                        top_pool.head(100)[["name", "smiles", "InChIKey"]],
+                        seen_inchikeys,
+                        0.0
+                    )
+                    seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
+                    no_improvement_counter = 0
+                
+                gen_time = time.time() - iter_start_time
+                bt.logging.info(f"[Miner] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)")
+
+                if data.empty:
+                    bt.logging.warning(f"[Miner] Iteration {iteration}: No valid molecules produced; continuing")
+                    continue
                 
                 if not seed_df.empty:
-                    seed_df = seed_df.drop_duplicates(subset=["InChIKey"], keep="first")
-            
-            seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
-            total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
-            prev_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+                    data = pd.concat([data, seed_df])
+                    data = data.drop_duplicates(subset=["InChIKey"], keep="first")
+                    seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
 
-            if not total_data.empty:
-                top_pool = pd.concat([top_pool, total_data], ignore_index=True)
-                top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
-                top_pool = top_pool.sort_values(by="score", ascending=False)
-            else:
-                bt.logging.warning(f"[Miner] Iteration {iteration}: No valid scored data to add to pool")
+                try:
+                    filterd_data = data[~data["InChIKey"].isin(seen_inchikeys)]
+                    if len(filterd_data) < len(data):
+                        bt.logging.warning(
+                            f"[Miner] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen"
+                        )
 
-            # Track best molecules for later intensive exploration
-            if not top_pool.empty and iteration % 5 == 0:
-                best_molecules_history.append({
-                    'iteration': iteration,
-                    'molecules': top_pool.head(10)[["name", "smiles", "InChIKey", "score"]].copy()
-                })
-                if len(best_molecules_history) > 6:
-                    best_molecules_history.pop(0)
+                    dup_ratio = (len(data) - len(filterd_data)) / max(1, len(data))
+                    
+                    if dup_ratio > 0.7:
+                        mutation_prob = min(0.9, mutation_prob * 1.5)
+                        elite_frac = max(0.15, elite_frac * 0.7)
+                        bt.logging.warning(f"[Miner] SEVERE duplication ({dup_ratio:.2%})! mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                    elif dup_ratio > 0.5:
+                        mutation_prob = min(0.7, mutation_prob * 1.3)
+                        elite_frac = max(0.2, elite_frac * 0.8)
+                        bt.logging.warning(f"[Miner] High duplication ({dup_ratio:.2%}), mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                    elif dup_ratio < 0.15 and not top_pool.empty and iteration > 10:
+                        mutation_prob = max(0.05, mutation_prob * 0.95)
+                        elite_frac = min(0.85, elite_frac * 1.05)
+
+                    data = filterd_data
+
+                except Exception as e:
+                    bt.logging.warning(f"[Miner] Pre-score deduplication failed: {e}")
+
+                if data.empty:
+                    bt.logging.error(f"[Miner] Iteration {iteration}: ALL molecules were duplicates! Skipping scoring and continuing...")
+                    mutation_prob = min(0.95, mutation_prob * 2.0)
+                    elite_frac = max(0.1, elite_frac * 0.5)
+                    bt.logging.warning(f"[Miner] Emergency diversity boost: mut={mutation_prob:.2f}, elite={elite_frac:.2f}")
+                    continue  # Skip to next iteration
+
+                data = data.reset_index(drop=True)
+                cpu_futures = []
+                if not top_pool.empty and iteration > 3:
+                    if score_improvement_rate < 0.01:
+                        cpu_futures.append((
+                            cpu_executor.submit(
+                                _cpu_random_candidates_with_similarity,
+                                iteration,
+                                40,
+                                config,
+                                top_pool.head(5)[["name", "smiles", "InChIKey"]],
+                                seen_inchikeys,
+                                0.80
+                            ),
+                            "tight-top5"
+                        ))
+                        
+                        cpu_futures.append((
+                            cpu_executor.submit(
+                                _cpu_random_candidates_with_similarity,
+                                iteration,
+                                30,
+                                config,
+                                top_pool.head(20)[["name", "smiles", "InChIKey"]],
+                                seen_inchikeys,
+                                0.65
+                            ),
+                            "medium-top20"
+                        ))
+                
+                gpu_start_time = time.time()
+
+                if len(data) == 0:
+                    bt.logging.error(f"[Miner] Iteration {iteration}: No molecules to score! Continuing...")
+                    continue
+
+                data["Target"] = target_score_from_data(data["smiles"])
+                data["Anti"] = antitarget_scores()
+                data["score"] = data["Target"] - (config["antitarget_weight"] * data["Anti"])
+
+                if data["score"].isna().all():
+                    bt.logging.error(f"[Miner] Iteration {iteration}: Scoring failed (all NaN)! Continuing...")
+                    continue
+                
+                gpu_time = time.time() - gpu_start_time
+                total_gpu_time += gpu_time
+                total_gpu_run += len(data)
+                bt.logging.info(f"[Miner] Iteration {iteration}: GPU scoring time ~{gpu_time:.2f}s")
+                
+                if cpu_futures:
+                    for cpu_future, strategy_name in cpu_futures:
+                        try:
+                            cpu_df = cpu_future.result(timeout=0)
+                            if not cpu_df.empty:
+                                if seed_df.empty:
+                                    seed_df = cpu_df.copy()
+                                else:
+                                    seed_df = pd.concat([seed_df, cpu_df], ignore_index=True)
+                                bt.logging.info(f"[Miner] CPU similarity ({strategy_name}) found {len(cpu_df)} candidates")
+                        except TimeoutError:
+                            pass
+                        except Exception as e:
+                            bt.logging.warning(f"[Miner] CPU similarity ({strategy_name}) failed: {e}")
+                    
+                    if not seed_df.empty:
+                        seed_df = seed_df.drop_duplicates(subset=["InChIKey"], keep="first")
+                
+                seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
+                total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
+                prev_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+
+                if not total_data.empty:
+                    top_pool = pd.concat([top_pool, total_data], ignore_index=True)
+                    top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
+                    top_pool = top_pool.sort_values(by="score", ascending=False)
+                    
+                else:
+                    bt.logging.warning(f"[Miner] Iteration {iteration}: No valid scored data to add to pool")
 
             remaining_time = 1800 - (time.time() - start)
             if remaining_time <= 60:
@@ -791,7 +815,7 @@ def main(config: dict):
             total_time = time.time() - start
             
             bt.logging.info(
-                f"[V8] Iteration {iteration} || Time: {iter_total_time:.2f}s | Total: {total_time:.2f}s | "
+                f"Iteration {iteration} || Time: {iter_total_time:.2f}s | Total: {total_time:.2f}s | "
                 f"Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | "
                 f"Min: {top_pool['score'].min():.4f} | Elite: {elite_frac:.2f} | "
                 f"Mut: {mutation_prob:.2f} | Improve: {score_improvement_rate:.4f}"
